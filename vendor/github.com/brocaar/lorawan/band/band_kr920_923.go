@@ -4,7 +4,7 @@ import "time"
 
 func newKR920Band() (Band, error) {
 	return Band{
-		DefaultTXPower:   23, // for gateway
+		DefaultTXPower:   20,
 		ImplementsCFlist: true,
 		RX2Frequency:     921900000,
 		RX2DataRate:      0,
@@ -48,13 +48,12 @@ func newKR920Band() (Band, error) {
 
 		TXPowerOffset: []int{
 			0,
-			-2,
-			-4,
 			-6,
-			-8,
 			-10,
 			-12,
-			-14,
+			-15,
+			-18,
+			-20,
 		},
 
 		UplinkChannels: []Channel{
