@@ -14,7 +14,8 @@
   version = "1.4.0"
 
 [[constraint]]
-  version = "v1.1.0"
+#  version = "v1.1.0"
+  branch = "master"
   name = "github.com/golang/protobuf"
 
 [[constraint]]

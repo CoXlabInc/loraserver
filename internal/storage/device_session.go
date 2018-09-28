@@ -343,8 +343,8 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 			// downlink frame-counter on a re-transmit, which is not what we
 			// want.
 			if s.SkipFCntValidation {
-				fullFCnt = macPL.FHDR.FCnt
-				s.FCntUp = macPL.FHDR.FCnt
+				fullFCnt = (s.FCntUp & 0xFFFF0000) | macPL.FHDR.FCnt
+				macPL.FHDR.FCnt = fullFCnt
 				s.UplinkHistory = []UplinkHistory{}
 
 				// validate if the mic is valid given the FCnt reset
@@ -364,6 +364,9 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 					}).Warning("frame counters reset")
 					return s, nil
 				}
+			   	log.WithFields(log.Fields{
+					"fCntUp":s.FCntUp,
+				}).Warning("SKIP FCNT VALIDATION but MIC failed")
 			}
 			// try the next node-session
 			continue
@@ -376,10 +379,19 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 			return DeviceSession{}, errors.Wrap(err, "validate mic error")
 		}
 		if micOK {
+			log.WithFields(log.Fields{
+				"dev_addr": macPL.FHDR.DevAddr,
+				"numSessions": len(sessions),
+				"fCntUp":s.FCntUp,
+			}).Info("OK")
 			return s, nil
 		}
 	}
 
+	log.WithFields(log.Fields{
+		"dev_addr": macPL.FHDR.DevAddr,
+		"numSessions": len(sessions),
+	}).Warning("??")
 	return DeviceSession{}, ErrDoesNotExistOrFCntOrMICInvalid
 }
 
