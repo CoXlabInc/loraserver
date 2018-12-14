@@ -5,21 +5,22 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/brocaar/loraserver/internal/uplink"
-
-	"github.com/brocaar/lorawan/band"
-
 	. "github.com/smartystreets/goconvey/convey"
 
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/models"
 	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/loraserver/internal/test"
+	"github.com/brocaar/loraserver/internal/uplink"
 	"github.com/brocaar/lorawan"
 	"github.com/brocaar/lorawan/backend"
+	"github.com/brocaar/lorawan/band"
 )
 
 type otaaTestCase struct {
+	BeforeFunc               func(*otaaTestCase) error
 	Name                     string                     // name of the test
 	RXInfo                   gw.RXInfo                  // rx-info of the "received" packet
 	PHYPayload               lorawan.PHYPayload         // received PHYPayload
@@ -43,25 +44,25 @@ func TestOTAAScenarios(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
-	common.RedisPool = common.NewRedisPool(conf.RedisURL)
-	common.NetID = [3]byte{3, 2, 1}
+	config.C.PostgreSQL.DB = db
+	config.C.Redis.Pool = common.NewRedisPool(conf.RedisURL)
+	config.C.NetworkServer.NetID = [3]byte{3, 2, 1}
 
 	Convey("Given a clean database with a device", t, func() {
-		test.MustResetDB(common.DB)
-		test.MustFlushRedis(common.RedisPool)
+		test.MustResetDB(config.C.PostgreSQL.DB)
+		test.MustFlushRedis(config.C.Redis.Pool)
 
 		asClient := test.NewApplicationClient()
 		jsClient := test.NewJoinServerClient()
 
-		common.ApplicationServerPool = test.NewApplicationServerPool(asClient)
-		common.JoinServerPool = test.NewJoinServerPool(jsClient)
-		common.Gateway = test.NewGatewayBackend()
+		config.C.ApplicationServer.Pool = test.NewApplicationServerPool(asClient)
+		config.C.JoinServer.Pool = test.NewJoinServerPool(jsClient)
+		config.C.NetworkServer.Gateway.Backend.Backend = test.NewGatewayBackend()
 
 		sp := storage.ServiceProfile{
 			ServiceProfile: backend.ServiceProfile{},
 		}
-		So(storage.CreateServiceProfile(common.DB, &sp), ShouldBeNil)
+		So(storage.CreateServiceProfile(config.C.PostgreSQL.DB, &sp), ShouldBeNil)
 
 		dp := storage.DeviceProfile{
 			DeviceProfile: backend.DeviceProfile{
@@ -70,12 +71,12 @@ func TestOTAAScenarios(t *testing.T) {
 				RXDataRate2: 5,
 			},
 		}
-		So(storage.CreateDeviceProfile(common.DB, &dp), ShouldBeNil)
+		So(storage.CreateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
 
 		rp := storage.RoutingProfile{
 			RoutingProfile: backend.RoutingProfile{},
 		}
-		So(storage.CreateRoutingProfile(common.DB, &rp), ShouldBeNil)
+		So(storage.CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
 
 		d := storage.Device{
 			DevEUI:           lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
@@ -83,13 +84,19 @@ func TestOTAAScenarios(t *testing.T) {
 			RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
 			ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 		}
-		So(storage.CreateDevice(common.DB, &d), ShouldBeNil)
+		So(storage.CreateDevice(config.C.PostgreSQL.DB, &d), ShouldBeNil)
 
 		appKey := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
+		c0, err := config.C.NetworkServer.Band.Band.GetDownlinkChannel(0)
+		So(err, ShouldBeNil)
+
+		c0MinDR, err := config.C.NetworkServer.Band.Band.GetDataRate(c0.MinDR)
+		So(err, ShouldBeNil)
+
 		rxInfo := gw.RXInfo{
-			Frequency: common.Band.UplinkChannels[0].Frequency,
-			DataRate:  common.Band.DataRates[common.Band.UplinkChannels[0].DataRates[0]],
+			Frequency: c0.Frequency,
+			DataRate:  c0MinDR,
 		}
 
 		jrPayload := lorawan.PHYPayload{
@@ -109,7 +116,7 @@ func TestOTAAScenarios(t *testing.T) {
 
 		jaPayload := lorawan.JoinAcceptPayload{
 			AppNonce: [3]byte{3, 2, 1},
-			NetID:    common.NetID,
+			NetID:    config.C.NetworkServer.NetID,
 			DLSettings: lorawan.DLSettings{
 				RX2DataRate: 2,
 				RX1DROffset: 1,
@@ -191,10 +198,10 @@ func TestOTAAScenarios(t *testing.T) {
 						PHYPayload: backend.HEXBytes(jrBytes),
 						DevEUI:     d.DevEUI,
 						DLSettings: lorawan.DLSettings{
-							RX2DataRate: uint8(common.RX2DR),
-							RX1DROffset: uint8(common.RX1DROffset),
+							RX2DataRate: uint8(config.C.NetworkServer.NetworkSettings.RX2DR),
+							RX1DROffset: uint8(config.C.NetworkServer.NetworkSettings.RX1DROffset),
 						},
-						RxDelay: common.RX1Delay,
+						RxDelay: config.C.NetworkServer.NetworkSettings.RX1Delay,
 					},
 					ExpectedTXInfo: gw.TXInfo{
 						MAC:       rxInfo.MAC,
@@ -206,15 +213,80 @@ func TestOTAAScenarios(t *testing.T) {
 					},
 					ExpectedPHYPayload: jaPHY,
 					ExpectedDeviceSession: storage.DeviceSession{
-						RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
-						DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
-						ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
-						JoinEUI:          lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
-						DevEUI:           lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
-						NwkSKey:          lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-						RXWindow:         storage.RX1,
-						EnabledChannels:  []int{0, 1, 2},
-						LastRXInfoSet:    []gw.RXInfo{rxInfo},
+						RoutingProfileID:      rp.RoutingProfile.RoutingProfileID,
+						DeviceProfileID:       dp.DeviceProfile.DeviceProfileID,
+						ServiceProfileID:      sp.ServiceProfile.ServiceProfileID,
+						JoinEUI:               lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+						DevEUI:                lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
+						NwkSKey:               lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+						RXWindow:              storage.RX1,
+						EnabledUplinkChannels: []int{0, 1, 2},
+						ExtraUplinkChannels:   map[int]band.Channel{},
+						LastRXInfoSet:         []models.RXInfo{{}},
+						LastDevStatusMargin:   127,
+						RX2Frequency:          config.C.NetworkServer.Band.Band.GetDefaults().RX2Frequency,
+						NbTrans:               1,
+					},
+				},
+				{
+					BeforeFunc: func(tc *otaaTestCase) error {
+						d.SkipFCntCheck = true
+						return storage.UpdateDevice(db, &d)
+					},
+					Name:       "join-request accepted + skip fcnt check",
+					RXInfo:     rxInfo,
+					PHYPayload: jrPayload,
+					AppKey:     appKey,
+					JoinServerJoinAnsPayload: backend.JoinAnsPayload{
+						PHYPayload: backend.HEXBytes(jaBytes),
+						Result: backend.Result{
+							ResultCode: backend.Success,
+						},
+						NwkSKey: &backend.KeyEnvelope{
+							AESKey: lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+						},
+					},
+
+					ExpectedJoinReqPayload: backend.JoinReqPayload{
+						BasePayload: backend.BasePayload{
+							ProtocolVersion: backend.ProtocolVersion1_0,
+							SenderID:        "030201",
+							ReceiverID:      "0102030405060708",
+							MessageType:     backend.JoinReq,
+						},
+						MACVersion: dp.DeviceProfile.MACVersion,
+						PHYPayload: backend.HEXBytes(jrBytes),
+						DevEUI:     d.DevEUI,
+						DLSettings: lorawan.DLSettings{
+							RX2DataRate: uint8(config.C.NetworkServer.NetworkSettings.RX2DR),
+							RX1DROffset: uint8(config.C.NetworkServer.NetworkSettings.RX1DROffset),
+						},
+						RxDelay: config.C.NetworkServer.NetworkSettings.RX1Delay,
+					},
+					ExpectedTXInfo: gw.TXInfo{
+						MAC:       rxInfo.MAC,
+						Timestamp: &timestamp,
+						Frequency: rxInfo.Frequency,
+						Power:     14,
+						DataRate:  rxInfo.DataRate,
+						CodeRate:  rxInfo.CodeRate,
+					},
+					ExpectedPHYPayload: jaPHY,
+					ExpectedDeviceSession: storage.DeviceSession{
+						RoutingProfileID:      rp.RoutingProfile.RoutingProfileID,
+						DeviceProfileID:       dp.DeviceProfile.DeviceProfileID,
+						ServiceProfileID:      sp.ServiceProfile.ServiceProfileID,
+						JoinEUI:               lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+						DevEUI:                lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
+						NwkSKey:               lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+						RXWindow:              storage.RX1,
+						EnabledUplinkChannels: []int{0, 1, 2},
+						ExtraUplinkChannels:   map[int]band.Channel{},
+						LastRXInfoSet:         []models.RXInfo{{}},
+						LastDevStatusMargin:   127,
+						RX2Frequency:          config.C.NetworkServer.Band.Band.GetDefaults().RX2Frequency,
+						SkipFCntValidation:    true,
+						NbTrans:               1,
 					},
 				},
 				{
@@ -222,7 +294,7 @@ func TestOTAAScenarios(t *testing.T) {
 					RXInfo:        rxInfo,
 					PHYPayload:    jrPayload,
 					AppKey:        appKey,
-					ExtraChannels: []int{868400000, 868500000, 868600000},
+					ExtraChannels: []int{868600000, 868700000, 868800000},
 					JoinServerJoinAnsPayload: backend.JoinAnsPayload{
 						PHYPayload: backend.HEXBytes(jaBytes),
 						Result: backend.Result{
@@ -252,11 +324,11 @@ func TestOTAAScenarios(t *testing.T) {
 						PHYPayload: backend.HEXBytes(jrBytes),
 						DevEUI:     d.DevEUI,
 						DLSettings: lorawan.DLSettings{
-							RX2DataRate: uint8(common.RX2DR),
-							RX1DROffset: uint8(common.RX1DROffset),
+							RX2DataRate: uint8(config.C.NetworkServer.NetworkSettings.RX2DR),
+							RX1DROffset: uint8(config.C.NetworkServer.NetworkSettings.RX1DROffset),
 						},
-						RxDelay: common.RX1Delay,
-						CFList:  &lorawan.CFList{868400000, 868500000, 868600000},
+						RxDelay: config.C.NetworkServer.NetworkSettings.RX1Delay,
+						CFList:  &lorawan.CFList{868600000, 868700000, 868800000},
 					},
 					ExpectedTXInfo: gw.TXInfo{
 						MAC:       rxInfo.MAC,
@@ -268,15 +340,23 @@ func TestOTAAScenarios(t *testing.T) {
 					},
 					ExpectedPHYPayload: jaPHY,
 					ExpectedDeviceSession: storage.DeviceSession{
-						RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
-						DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
-						ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
-						JoinEUI:          lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
-						DevEUI:           lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
-						NwkSKey:          lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
-						RXWindow:         storage.RX1,
-						EnabledChannels:  []int{0, 1, 2, 3, 4, 5},
-						LastRXInfoSet:    []gw.RXInfo{rxInfo},
+						RoutingProfileID:      rp.RoutingProfile.RoutingProfileID,
+						DeviceProfileID:       dp.DeviceProfile.DeviceProfileID,
+						ServiceProfileID:      sp.ServiceProfile.ServiceProfileID,
+						JoinEUI:               lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+						DevEUI:                lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8},
+						NwkSKey:               lorawan.AES128Key{16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1},
+						RXWindow:              storage.RX1,
+						EnabledUplinkChannels: []int{0, 1, 2, 3, 4, 5},
+						ExtraUplinkChannels: map[int]band.Channel{
+							3: band.Channel{Frequency: 868600000, MinDR: 0, MaxDR: 5},
+							4: band.Channel{Frequency: 868700000, MinDR: 0, MaxDR: 5},
+							5: band.Channel{Frequency: 868800000, MinDR: 0, MaxDR: 5},
+						},
+						LastRXInfoSet:       []models.RXInfo{{}},
+						LastDevStatusMargin: 127,
+						RX2Frequency:        config.C.NetworkServer.Band.Band.GetDefaults().RX2Frequency,
+						NbTrans:             1,
 					},
 				},
 			}
@@ -289,12 +369,16 @@ func TestOTAAScenarios(t *testing.T) {
 func runOTAATests(asClient *test.ApplicationClient, jsClient *test.JoinServerClient, tests []otaaTestCase) {
 	for i, t := range tests {
 		Convey(fmt.Sprintf("When testing: %s [%d]", t.Name, i), func() {
+			if t.BeforeFunc != nil {
+				So(t.BeforeFunc(&t), ShouldBeNil)
+			}
+
 			// reset band
 			var err error
-			common.Band, err = band.GetConfig(band.EU_863_870, false, lorawan.DwellTimeNoLimit)
+			config.C.NetworkServer.Band.Band, err = band.GetConfig(band.EU_863_870, false, lorawan.DwellTimeNoLimit)
 			So(err, ShouldBeNil)
 			for _, f := range t.ExtraChannels {
-				So(common.Band.AddChannel(f), ShouldBeNil)
+				So(config.C.NetworkServer.Band.Band.AddChannel(f, 0, 5), ShouldBeNil)
 			}
 
 			// set mocks
@@ -303,12 +387,12 @@ func runOTAATests(asClient *test.ApplicationClient, jsClient *test.JoinServerCli
 
 			// create device-activations
 			for _, da := range t.DeviceActivations {
-				So(storage.CreateDeviceActivation(common.DB, &da), ShouldBeNil)
+				So(storage.CreateDeviceActivation(config.C.PostgreSQL.DB, &da), ShouldBeNil)
 			}
 
 			// create device-queue items
 			for _, qi := range t.DeviceQueueItems {
-				So(storage.CreateDeviceQueueItem(common.DB, &qi), ShouldBeNil)
+				So(storage.CreateDeviceQueueItem(config.C.PostgreSQL.DB, &qi), ShouldBeNil)
 			}
 
 			err = uplink.HandleRXPacket(gw.RXPacket{
@@ -322,7 +406,7 @@ func runOTAATests(asClient *test.ApplicationClient, jsClient *test.JoinServerCli
 			So(t.ExpectedError, ShouldBeNil)
 
 			Convey("Then the device-queue has been flushed", func() {
-				items, err := storage.GetDeviceQueueItemsForDevEUI(common.DB, lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8})
+				items, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8})
 				So(err, ShouldBeNil)
 				So(items, ShouldHaveLength, 0)
 			})
@@ -341,22 +425,23 @@ func runOTAATests(asClient *test.ApplicationClient, jsClient *test.JoinServerCli
 			})
 
 			Convey("Then the expected txinfo was used", func() {
-				So(common.Gateway.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
-				txPacket := <-common.Gateway.(*test.GatewayBackend).TXPacketChan
+				So(config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
+				txPacket := <-config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan
 
+				So(txPacket.Token, ShouldNotEqual, 0)
 				So(txPacket.TXInfo, ShouldResemble, t.ExpectedTXInfo)
 			})
 
 			Convey("Then the expected PHYPayload was sent", func() {
-				So(common.Gateway.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
-				txPacket := <-common.Gateway.(*test.GatewayBackend).TXPacketChan
+				So(config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
+				txPacket := <-config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan
 
 				So(txPacket.PHYPayload.DecryptJoinAcceptPayload(t.AppKey), ShouldBeNil)
 				So(txPacket.PHYPayload, ShouldResemble, t.ExpectedPHYPayload)
 			})
 
 			Convey("Then the expected device-session was created", func() {
-				ds, err := storage.GetDeviceSession(common.RedisPool, lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8})
+				ds, err := storage.GetDeviceSession(config.C.Redis.Pool, lorawan.EUI64{2, 2, 3, 4, 5, 6, 7, 8})
 				So(err, ShouldBeNil)
 				So(ds.DevAddr, ShouldNotEqual, lorawan.DevAddr{})
 				ds.DevAddr = lorawan.DevAddr{}
@@ -364,7 +449,7 @@ func runOTAATests(asClient *test.ApplicationClient, jsClient *test.JoinServerCli
 			})
 
 			Convey("Then a device-activation record was created", func() {
-				da, err := storage.GetLastDeviceActivationForDevEUI(common.DB, t.ExpectedDeviceSession.DevEUI)
+				da, err := storage.GetLastDeviceActivationForDevEUI(config.C.PostgreSQL.DB, t.ExpectedDeviceSession.DevEUI)
 				So(err, ShouldBeNil)
 				So(da.DevAddr, ShouldNotEqual, lorawan.DevAddr{})
 				So(da.NwkSKey, ShouldEqual, t.ExpectedDeviceSession.NwkSKey)

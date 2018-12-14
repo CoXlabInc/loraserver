@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/garyburd/redigo/redis"
-	"github.com/jmoiron/sqlx"
 	migrate "github.com/rubenv/sql-migrate"
 	log "github.com/sirupsen/logrus"
 	context "golang.org/x/net/context"
@@ -14,9 +13,10 @@ import (
 	"github.com/brocaar/loraserver/api/as"
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/nc"
-	"github.com/brocaar/loraserver/internal/asclient"
+	"github.com/brocaar/loraserver/internal/api/client/asclient"
+	"github.com/brocaar/loraserver/internal/api/client/jsclient"
 	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/jsclient"
+	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/migrations"
 	"github.com/brocaar/lorawan"
 	"github.com/brocaar/lorawan/backend"
@@ -26,15 +26,19 @@ import (
 func init() {
 	log.SetLevel(log.ErrorLevel)
 
-	common.BandName = band.EU_863_870
-	common.DeduplicationDelay = 5 * time.Millisecond
-	common.GetDownlinkDataDelay = 5 * time.Millisecond
+	config.C.NetworkServer.DeviceSessionTTL = time.Hour
+	config.C.NetworkServer.Band.Name = band.EU_863_870
+	config.C.NetworkServer.Band.Band, _ = band.GetConfig(config.C.NetworkServer.Band.Name, false, lorawan.DwellTimeNoLimit)
 
-	loc, err := time.LoadLocation("Europe/Amsterdam")
+	config.C.NetworkServer.DeduplicationDelay = 5 * time.Millisecond
+	config.C.NetworkServer.GetDownlinkDataDelay = 5 * time.Millisecond
+
+	config.C.NetworkServer.Gateway.Stats.Timezone = "Europe/Amsterdam"
+	loc, err := time.LoadLocation(config.C.NetworkServer.Gateway.Stats.Timezone)
 	if err != nil {
 		panic(err)
 	}
-	common.TimeLocation = loc
+	config.C.NetworkServer.Gateway.Stats.TimezoneLocation = loc
 }
 
 // Config contains the test configuration.
@@ -48,10 +52,14 @@ func GetConfig() *Config {
 	var err error
 	log.SetLevel(log.ErrorLevel)
 
-	common.Band, err = band.GetConfig(band.EU_863_870, false, lorawan.DwellTimeNoLimit)
+	config.C.NetworkServer.Band.Band, err = band.GetConfig(band.EU_863_870, false, lorawan.DwellTimeNoLimit)
 	if err != nil {
 		panic(err)
 	}
+
+	config.C.NetworkServer.NetworkSettings.RX2Frequency = config.C.NetworkServer.Band.Band.GetDefaults().RX2Frequency
+	config.C.NetworkServer.NetworkSettings.RX2DR = config.C.NetworkServer.Band.Band.GetDefaults().RX2DataRate
+	config.C.NetworkServer.NetworkSettings.RX1Delay = 0
 
 	c := &Config{
 		RedisURL:    "redis://localhost:6379",
@@ -92,38 +100,46 @@ func MustPrefillRedisPool(p *redis.Pool, count int) {
 }
 
 // MustResetDB re-applies all database migrations.
-func MustResetDB(db *sqlx.DB) {
+func MustResetDB(db *common.DBLogger) {
 	m := &migrate.AssetMigrationSource{
 		Asset:    migrations.Asset,
 		AssetDir: migrations.AssetDir,
 		Dir:      "",
 	}
-	if _, err := migrate.Exec(db.DB, "postgres", m, migrate.Down); err != nil {
+	if _, err := migrate.Exec(db.DB.DB, "postgres", m, migrate.Down); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := migrate.Exec(db.DB, "postgres", m, migrate.Up); err != nil {
+	if _, err := migrate.Exec(db.DB.DB, "postgres", m, migrate.Up); err != nil {
 		log.Fatal(err)
 	}
 }
 
 // GatewayBackend is a test gateway backend.
 type GatewayBackend struct {
-	rxPacketChan    chan gw.RXPacket
-	TXPacketChan    chan gw.TXPacket
-	statsPacketChan chan gw.GatewayStatsPacket
+	rxPacketChan            chan gw.RXPacket
+	TXPacketChan            chan gw.TXPacket
+	GatewayConfigPacketChan chan gw.GatewayConfigPacket
+	statsPacketChan         chan gw.GatewayStatsPacket
 }
 
 // NewGatewayBackend returns a new GatewayBackend.
 func NewGatewayBackend() *GatewayBackend {
 	return &GatewayBackend{
-		rxPacketChan: make(chan gw.RXPacket, 100),
-		TXPacketChan: make(chan gw.TXPacket, 100),
+		rxPacketChan:            make(chan gw.RXPacket, 100),
+		TXPacketChan:            make(chan gw.TXPacket, 100),
+		GatewayConfigPacketChan: make(chan gw.GatewayConfigPacket, 100),
 	}
 }
 
 // SendTXPacket method.
 func (b *GatewayBackend) SendTXPacket(txPacket gw.TXPacket) error {
 	b.TXPacketChan <- txPacket
+	return nil
+}
+
+// SendGatewayConfigPacket method.
+func (b *GatewayBackend) SendGatewayConfigPacket(config gw.GatewayConfigPacket) error {
+	b.GatewayConfigPacketChan <- config
 	return nil
 }
 
@@ -191,7 +207,7 @@ type ApplicationServerPool struct {
 }
 
 // Get returns the Client.
-func (p *ApplicationServerPool) Get(hostname string) (as.ApplicationServerClient, error) {
+func (p *ApplicationServerPool) Get(hostname string, caCert, tlsCert, tlsKey []byte) (as.ApplicationServerClient, error) {
 	p.GetHostname = hostname
 	return p.Client, nil
 }

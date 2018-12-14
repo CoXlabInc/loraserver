@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/brocaar/loraserver/internal/gateway"
+	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/loraserver/internal/uplink"
 	"github.com/brocaar/lorawan/backend"
@@ -42,16 +42,18 @@ func TestSendProprietaryPayloadScenarios(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
+	config.C.PostgreSQL.DB = db
 
 	Convey("Given a clean state", t, func() {
-		test.MustResetDB(common.DB)
+		test.MustResetDB(config.C.PostgreSQL.DB)
 
-		common.Gateway = test.NewGatewayBackend()
+		config.C.NetworkServer.Gateway.Backend.Backend = test.NewGatewayBackend()
 		api := api.NewNetworkServerAPI()
 
 		Convey("Given a set of send proprietary payload tests", func() {
 			trueBool := true
+			dr5, err := config.C.NetworkServer.Band.Band.GetDataRate(5)
+			So(err, ShouldBeNil)
 
 			tests := []sendProprietaryPayloadTestCase{
 				{
@@ -69,7 +71,7 @@ func TestSendProprietaryPayloadScenarios(t *testing.T) {
 						Immediately: true,
 						Frequency:   868100000,
 						Power:       14,
-						DataRate:    common.Band.DataRates[5],
+						DataRate:    dr5,
 						CodeRate:    "4/5",
 						IPol:        &trueBool,
 					},
@@ -90,8 +92,8 @@ func TestSendProprietaryPayloadScenarios(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					Convey("Then the expected frame was sent", func() {
-						So(common.Gateway.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
-						txPacket := <-common.Gateway.(*test.GatewayBackend).TXPacketChan
+						So(config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan, ShouldHaveLength, 1)
+						txPacket := <-config.C.NetworkServer.Gateway.Backend.Backend.(*test.GatewayBackend).TXPacketChan
 						So(txPacket.TXInfo, ShouldResemble, t.ExpectedTXInfo)
 						So(txPacket.PHYPayload, ShouldResemble, t.ExpectedPHYPayload)
 					})
@@ -107,37 +109,40 @@ func TestUplinkProprietaryPHYPayload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
-	common.RedisPool = common.NewRedisPool(conf.RedisURL)
+	config.C.PostgreSQL.DB = db
+	config.C.Redis.Pool = common.NewRedisPool(conf.RedisURL)
 
 	Convey("Given a clean state with a gateway and routing profile", t, func() {
-		test.MustResetDB(common.DB)
-		test.MustFlushRedis(common.RedisPool)
+		test.MustResetDB(config.C.PostgreSQL.DB)
+		test.MustFlushRedis(config.C.Redis.Pool)
 
 		asClient := test.NewApplicationClient()
-		common.ApplicationServerPool = test.NewApplicationServerPool(asClient)
-		common.Gateway = test.NewGatewayBackend()
+		config.C.ApplicationServer.Pool = test.NewApplicationServerPool(asClient)
+		config.C.NetworkServer.Gateway.Backend.Backend = test.NewGatewayBackend()
 
 		// the routing profile is needed as the ns will send the proprietary
 		// frame to all application-servers.
 		rp := storage.RoutingProfile{
 			RoutingProfile: backend.RoutingProfile{},
 		}
-		So(storage.CreateRoutingProfile(common.DB, &rp), ShouldBeNil)
+		So(storage.CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
 
-		g := gateway.Gateway{
+		g := storage.Gateway{
 			MAC:         lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
 			Name:        "test-gw",
 			Description: "test gateway",
-			Location: gateway.GPSPoint{
+			Location: storage.GPSPoint{
 				Latitude:  1.1234,
 				Longitude: 2.345,
 			},
 			Altitude: 10,
 		}
-		So(gateway.CreateGateway(common.DB, &g), ShouldBeNil)
+		So(storage.CreateGateway(config.C.PostgreSQL.DB, &g), ShouldBeNil)
 
 		Convey("Given a set of testcases", func() {
+			dr0, err := config.C.NetworkServer.Band.Band.GetDataRate(0)
+			So(err, ShouldBeNil)
+
 			tests := []uplinkProprietaryPHYPayloadTestCase{
 				{
 					Name: "Uplink proprietary payload",
@@ -156,7 +161,7 @@ func TestUplinkProprietaryPHYPayload(t *testing.T) {
 						CodeRate:  "4/5",
 						RSSI:      -10,
 						LoRaSNR:   5,
-						DataRate:  common.Band.DataRates[0],
+						DataRate:  dr0,
 					},
 					ExpectedApplicationHandleProprietaryUp: &as.HandleProprietaryUplinkRequest{
 						MacPayload: []byte{1, 2, 3, 4},

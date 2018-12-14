@@ -11,15 +11,19 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/models"
 	"github.com/brocaar/lorawan"
+	"github.com/brocaar/lorawan/band"
 )
 
 const (
 	devAddrKeyTempl       = "lora:ns:devaddr:%s" // contains a set of DevEUIs using this DevAddr
 	deviceSessionKeyTempl = "lora:ns:device:%s"  // contains the session of a DevEUI
 )
+
+// UplinkHistorySize contains the number of frames to store
+const UplinkHistorySize = 20
 
 // RXWindow defines the RX window option.
 type RXWindow int8
@@ -34,6 +38,7 @@ const (
 type UplinkHistory struct {
 	FCnt         uint32
 	MaxSNR       float64
+	TXPowerIndex int
 	GatewayCount int
 }
 
@@ -71,6 +76,13 @@ type DeviceSession struct {
 	// This value is controlled by the ADR engine.
 	DR int
 
+	// ADR defines if the device has ADR enabled.
+	ADR bool
+
+	// MinSupportedTXPowerIndex defines the minimum supported tx-power index
+	// by the node (default 0).
+	MinSupportedTXPowerIndex int
+
 	// MaxSupportedTXPowerIndex defines the maximum supported tx-power index
 	// by the node, or 0 when not set.
 	MaxSupportedTXPowerIndex int
@@ -84,10 +96,12 @@ type DeviceSession struct {
 	// This value is controlled by the ADR engine.
 	NbTrans uint8
 
-	EnabledChannels    []int           // channels that are activated on the node
-	ChannelFrequencies []int           // frequency of each channel
-	UplinkHistory      []UplinkHistory // contains the last 20 transmissions
-	LastRXInfoSet      []gw.RXInfo     // sorted set (best at index 0)
+	EnabledChannels       []int                // deprecated, migrated by GetDeviceSession
+	EnabledUplinkChannels []int                // channels that are activated on the node
+	ExtraUplinkChannels   map[int]band.Channel // extra uplink channels, configured by the user
+	ChannelFrequencies    []int                // frequency of each channel
+	UplinkHistory         []UplinkHistory      // contains the last 20 transmissions
+	LastRXInfoSet         models.RXInfoSet     // sorted set (best at index 0)
 
 	// LastDevStatusRequest contains the timestamp when the last device-status
 	// request was made.
@@ -98,6 +112,15 @@ type DeviceSession struct {
 
 	// LastDevStatusMargin contains the last received margin status.
 	LastDevStatusMargin int8
+
+	// LastDownlinkTX contains the timestamp of the last downlink.
+	LastDownlinkTX time.Time
+
+	// Class-B related configuration.
+	BeaconLocked      bool
+	PingSlotNb        int
+	PingSlotDR        int
+	PingSlotFrequency int
 }
 
 // AppendUplinkHistory appends an UplinkHistory item and makes sure the list
@@ -114,14 +137,21 @@ func (s *DeviceSession) AppendUplinkHistory(up UplinkHistory) {
 	}
 
 	s.UplinkHistory = append(s.UplinkHistory, up)
-	if count := len(s.UplinkHistory); count > 20 {
-		s.UplinkHistory = s.UplinkHistory[count-20 : count]
+	if count := len(s.UplinkHistory); count > UplinkHistorySize {
+		s.UplinkHistory = s.UplinkHistory[count-UplinkHistorySize : count]
 	}
 }
 
 // GetPacketLossPercentage returns the percentage of packet-loss over the
 // records stored in UplinkHistory.
+// Note it returns 0 when the uplink history table hasn't been filled yet
+// to avoid reporting 33% for example when one of the first three uplinks
+// was lost.
 func (s DeviceSession) GetPacketLossPercentage() float64 {
+	if len(s.UplinkHistory) < UplinkHistorySize {
+		return 0
+	}
+
 	var lostPackets uint32
 	var previousFCnt uint32
 
@@ -161,7 +191,7 @@ func GetRandomDevAddr(p *redis.Pool, netID lorawan.NetID) (lorawan.DevAddr, erro
 func ValidateAndGetFullFCntUp(s DeviceSession, fCntUp uint32) (uint32, bool) {
 	// we need to compare the difference of the 16 LSB
 	gap := uint32(uint16(fCntUp) - uint16(s.FCntUp%65536))
-	if gap < common.Band.MaxFCntGap {
+	if gap < config.C.NetworkServer.Band.Band.GetDefaults().MaxFCntGap {
 		return s.FCntUp + gap, true
 	}
 	return 0, false
@@ -177,7 +207,7 @@ func SaveDeviceSession(p *redis.Pool, s DeviceSession) error {
 
 	c := p.Get()
 	defer c.Close()
-	exp := int64(common.NodeSessionTTL) / int64(time.Millisecond)
+	exp := int64(config.C.NetworkServer.DeviceSessionTTL) / int64(time.Millisecond)
 
 	c.Send("MULTI")
 	c.Send("PSETEX", fmt.Sprintf(deviceSessionKeyTempl, s.DevEUI), exp, buf.Bytes())
@@ -214,6 +244,21 @@ func GetDeviceSession(p *redis.Pool, devEUI lorawan.EUI64) (DeviceSession, error
 	err = gob.NewDecoder(bytes.NewReader(val)).Decode(&s)
 	if err != nil {
 		return s, errors.Wrap(err, "gob decode error")
+	}
+
+	// make sure the map is initialized
+	if s.ExtraUplinkChannels == nil {
+		s.ExtraUplinkChannels = make(map[int]band.Channel)
+	}
+
+	// migrate the EnabledChannels
+	if len(s.EnabledUplinkChannels) == 0 {
+		s.EnabledUplinkChannels = s.EnabledChannels
+	}
+
+	// in older versions, the value was not set
+	if s.RX2Frequency == 0 {
+		s.RX2Frequency = config.C.NetworkServer.Band.Band.GetDefaults().RX2Frequency
 	}
 
 	return s, nil
@@ -298,8 +343,9 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 			// downlink frame-counter on a re-transmit, which is not what we
 			// want.
 			if s.SkipFCntValidation {
-				fullFCnt = macPL.FHDR.FCnt
-				s.FCntUp = macPL.FHDR.FCnt
+				fullFCnt = (s.FCntUp & 0xFFFF0000) | macPL.FHDR.FCnt
+				macPL.FHDR.FCnt = fullFCnt
+				s.UplinkHistory = []UplinkHistory{}
 
 				// validate if the mic is valid given the FCnt reset
 				micOK, err := phy.ValidateMIC(s.NwkSKey)
@@ -318,6 +364,9 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 					}).Warning("frame counters reset")
 					return s, nil
 				}
+			   	log.WithFields(log.Fields{
+					"fCntUp":s.FCntUp,
+				}).Warning("SKIP FCNT VALIDATION but MIC failed")
 			}
 			// try the next node-session
 			continue
@@ -330,10 +379,19 @@ func GetDeviceSessionForPHYPayload(p *redis.Pool, phy lorawan.PHYPayload) (Devic
 			return DeviceSession{}, errors.Wrap(err, "validate mic error")
 		}
 		if micOK {
+			log.WithFields(log.Fields{
+				"dev_addr": macPL.FHDR.DevAddr,
+				"numSessions": len(sessions),
+				"fCntUp":s.FCntUp,
+			}).Info("OK")
 			return s, nil
 		}
 	}
 
+	log.WithFields(log.Fields{
+		"dev_addr": macPL.FHDR.DevAddr,
+		"numSessions": len(sessions),
+	}).Warning("??")
 	return DeviceSession{}, ErrDoesNotExistOrFCntOrMICInvalid
 }
 

@@ -2,31 +2,27 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"net"
 	"testing"
 	"time"
 
-	"github.com/brocaar/lorawan"
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/brocaar/lorawan/band"
 
-	"google.golang.org/grpc/codes"
-
+	. "github.com/smartystreets/goconvey/convey"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/ns"
-
-	"github.com/brocaar/loraserver/internal/api/auth"
 	"github.com/brocaar/loraserver/internal/common"
-	"github.com/brocaar/loraserver/internal/gateway"
-	"github.com/brocaar/loraserver/internal/maccommand"
-	"github.com/brocaar/loraserver/internal/node"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/framelog"
+	"github.com/brocaar/loraserver/internal/gps"
+	"github.com/brocaar/loraserver/internal/models"
 	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/loraserver/internal/test"
+	"github.com/brocaar/lorawan"
 	"github.com/brocaar/lorawan/backend"
-	"github.com/brocaar/lorawan/band"
-	. "github.com/smartystreets/goconvey/convey"
 )
 
 func TestNetworkServerAPI(t *testing.T) {
@@ -35,22 +31,176 @@ func TestNetworkServerAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
-	common.RedisPool = common.NewRedisPool(conf.RedisURL)
-	common.NetID = [3]byte{1, 2, 3}
+	config.C.PostgreSQL.DB = db
+	config.C.Redis.Pool = common.NewRedisPool(conf.RedisURL)
+	config.C.NetworkServer.NetID = [3]byte{1, 2, 3}
 
-	gateway.MustSetStatsAggregationIntervals([]string{"MINUTE"})
+	storage.MustSetStatsAggregationIntervals([]string{"MINUTE"})
 
 	Convey("Given a clean PostgreSQL and Redis database + api instance", t, func() {
 		test.MustResetDB(db)
-		test.MustFlushRedis(common.RedisPool)
+		test.MustFlushRedis(config.C.Redis.Pool)
 
+		grpcServer := grpc.NewServer()
+		apiServer := NewNetworkServerAPI()
+		ns.RegisterNetworkServerServer(grpcServer, apiServer)
+
+		ln, err := net.Listen("tcp", "localhost:0")
+		So(err, ShouldBeNil)
+		go grpcServer.Serve(ln)
+		defer func() {
+			grpcServer.Stop()
+			ln.Close()
+		}()
+
+		apiClient, err := grpc.Dial(ln.Addr().String(), grpc.WithInsecure(), grpc.WithBlock())
+		So(err, ShouldBeNil)
+
+		defer apiClient.Close()
+
+		api := ns.NewNetworkServerClient(apiClient)
 		ctx := context.Background()
-		api := NetworkServerAPI{}
 
 		devEUI := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
 		devAddr := [4]byte{6, 2, 3, 4}
 		nwkSKey := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+		Convey("When calling StreamFrameLogsForGateway", func() {
+			mac := lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8}
+			respChan := make(chan *ns.StreamFrameLogsForGatewayResponse)
+
+			client, err := api.StreamFrameLogsForGateway(ctx, &ns.StreamFrameLogsForGatewayRequest{
+				Mac: mac[:],
+			})
+			So(err, ShouldBeNil)
+
+			// some time for subscribing
+			time.Sleep(100 * time.Millisecond)
+
+			go func() {
+				for {
+					resp, err := client.Recv()
+					if err != nil {
+						break
+					}
+					respChan <- resp
+				}
+			}()
+
+			Convey("When logging a downlink gateway frame", func() {
+				dr0, err := config.C.NetworkServer.Band.Band.GetDataRate(0)
+				So(err, ShouldBeNil)
+
+				So(framelog.LogDownlinkFrameForGateway(framelog.DownlinkFrameLog{
+					TXInfo: gw.TXInfo{
+						MAC:      mac,
+						DataRate: dr0,
+					},
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataDown,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{},
+					},
+				}), ShouldBeNil)
+
+				Convey("Then the frame-log was received by the client", func() {
+					resp := <-respChan
+					So(resp.UplinkFrames, ShouldHaveLength, 0)
+					So(resp.DownlinkFrames, ShouldHaveLength, 1)
+				})
+			})
+
+			Convey("When logging an uplink gateway frame", func() {
+				So(framelog.LogUplinkFrameForGateways(models.RXPacket{
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{},
+					},
+					TXInfo: models.TXInfo{},
+					RXInfoSet: []models.RXInfo{
+						{
+							MAC: mac,
+						},
+					},
+				}), ShouldBeNil)
+
+				Convey("Then the frame-log was received by the client", func() {
+					resp := <-respChan
+					So(resp.UplinkFrames, ShouldHaveLength, 1)
+					So(resp.DownlinkFrames, ShouldHaveLength, 0)
+				})
+			})
+		})
+
+		Convey("When calling StreamFrameLogsForDevice", func() {
+			respChan := make(chan *ns.StreamFrameLogsForDeviceResponse)
+
+			client, err := api.StreamFrameLogsForDevice(ctx, &ns.StreamFrameLogsForDeviceRequest{
+				DevEUI: devEUI[:],
+			})
+			So(err, ShouldBeNil)
+
+			// some time for subscribing
+			time.Sleep(100 * time.Millisecond)
+
+			go func() {
+				for {
+					resp, err := client.Recv()
+					if err != nil {
+						break
+					}
+					respChan <- resp
+				}
+			}()
+
+			Convey("When logging a downlink device frame", func() {
+				dr0, err := config.C.NetworkServer.Band.Band.GetDataRate(0)
+				So(err, ShouldBeNil)
+
+				So(framelog.LogDownlinkFrameForDevEUI(devEUI, framelog.DownlinkFrameLog{
+					TXInfo: gw.TXInfo{
+						DataRate: dr0,
+					},
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataDown,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{},
+					},
+				}), ShouldBeNil)
+
+				Convey("Then the frame-log was received by the client", func() {
+					resp := <-respChan
+					So(resp.UplinkFrames, ShouldHaveLength, 0)
+					So(resp.DownlinkFrames, ShouldHaveLength, 1)
+				})
+			})
+
+			Convey("When logging an uplink device frame", func() {
+				So(framelog.LogUplinkFrameForDevEUI(devEUI, models.RXPacket{
+					PHYPayload: lorawan.PHYPayload{
+						MHDR: lorawan.MHDR{
+							MType: lorawan.UnconfirmedDataUp,
+							Major: lorawan.LoRaWANR1,
+						},
+						MACPayload: &lorawan.MACPayload{},
+					},
+					TXInfo: models.TXInfo{},
+				}), ShouldBeNil)
+
+				Convey("Then the frame-log was received by the client", func() {
+					resp := <-respChan
+					So(resp.UplinkFrames, ShouldHaveLength, 1)
+					So(resp.DownlinkFrames, ShouldHaveLength, 0)
+				})
+			})
+		})
 
 		Convey("When calling CreateServiceProfile", func() {
 			resp, err := api.CreateServiceProfile(ctx, &ns.CreateServiceProfileRequest{
@@ -182,6 +332,9 @@ func TestNetworkServerAPI(t *testing.T) {
 				RoutingProfile: &ns.RoutingProfile{
 					AsID: "application-server:1234",
 				},
+				CaCert:  "CACERT",
+				TlsCert: "TLSCERT",
+				TlsKey:  "TLSKEY",
 			})
 			So(err, ShouldBeNil)
 			So(resp.RoutingProfileID, ShouldNotEqual, "")
@@ -194,14 +347,19 @@ func TestNetworkServerAPI(t *testing.T) {
 				So(getResp.RoutingProfile, ShouldResemble, &ns.RoutingProfile{
 					AsID: "application-server:1234",
 				})
+				So(getResp.CaCert, ShouldEqual, "CACERT")
+				So(getResp.TlsCert, ShouldEqual, "TLSCERT")
 			})
 
-			Convey("Then UpdateRoutingProifle updates the routing-profile", func() {
+			Convey("Then UpdateRoutingProfile updates the routing-profile", func() {
 				_, err := api.UpdateRoutingProfile(ctx, &ns.UpdateRoutingProfileRequest{
 					RoutingProfile: &ns.RoutingProfile{
 						RoutingProfileID: resp.RoutingProfileID,
 						AsID:             "new-application-server:1234",
 					},
+					CaCert:  "CACERT2",
+					TlsCert: "TLSCERT2",
+					TlsKey:  "TLSKEY2",
 				})
 				So(err, ShouldBeNil)
 
@@ -212,6 +370,8 @@ func TestNetworkServerAPI(t *testing.T) {
 				So(getResp.RoutingProfile, ShouldResemble, &ns.RoutingProfile{
 					AsID: "new-application-server:1234",
 				})
+				So(getResp.CaCert, ShouldEqual, "CACERT2")
+				So(getResp.TlsCert, ShouldEqual, "TLSCERT2")
 			})
 
 			Convey("Then DeleteRoutingProfile deletes the routing-profile", func() {
@@ -287,12 +447,12 @@ func TestNetworkServerAPI(t *testing.T) {
 			sp := storage.ServiceProfile{
 				ServiceProfile: backend.ServiceProfile{},
 			}
-			So(storage.CreateServiceProfile(common.DB, &sp), ShouldBeNil)
+			So(storage.CreateServiceProfile(config.C.PostgreSQL.DB, &sp), ShouldBeNil)
 
 			rp := storage.RoutingProfile{
 				RoutingProfile: backend.RoutingProfile{},
 			}
-			So(storage.CreateRoutingProfile(common.DB, &rp), ShouldBeNil)
+			So(storage.CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
 
 			dp := storage.DeviceProfile{
 				DeviceProfile: backend.DeviceProfile{
@@ -303,7 +463,7 @@ func TestNetworkServerAPI(t *testing.T) {
 					},
 				},
 			}
-			So(storage.CreateDeviceProfile(common.DB, &dp), ShouldBeNil)
+			So(storage.CreateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
 
 			Convey("When calling CreateDevice", func() {
 				_, err := api.CreateDevice(ctx, &ns.CreateDeviceRequest{
@@ -312,6 +472,7 @@ func TestNetworkServerAPI(t *testing.T) {
 						DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
 						ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 						RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
+						SkipFCntCheck:    true,
 					},
 				})
 				So(err, ShouldBeNil)
@@ -326,6 +487,7 @@ func TestNetworkServerAPI(t *testing.T) {
 						DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
 						ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 						RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
+						SkipFCntCheck:    true,
 					})
 				})
 
@@ -343,6 +505,7 @@ func TestNetworkServerAPI(t *testing.T) {
 							DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
 							ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 							RoutingProfileID: rp2Resp.RoutingProfileID,
+							SkipFCntCheck:    true,
 						},
 					})
 					So(err, ShouldBeNil)
@@ -356,6 +519,7 @@ func TestNetworkServerAPI(t *testing.T) {
 						DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
 						ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 						RoutingProfileID: rp2Resp.RoutingProfileID,
+						SkipFCntCheck:    true,
 					})
 				})
 
@@ -381,12 +545,12 @@ func TestNetworkServerAPI(t *testing.T) {
 					DRMax: 6,
 				},
 			}
-			So(storage.CreateServiceProfile(common.DB, &sp), ShouldBeNil)
+			So(storage.CreateServiceProfile(config.C.PostgreSQL.DB, &sp), ShouldBeNil)
 
 			rp := storage.RoutingProfile{
 				RoutingProfile: backend.RoutingProfile{},
 			}
-			So(storage.CreateRoutingProfile(common.DB, &rp), ShouldBeNil)
+			So(storage.CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
 
 			dp := storage.DeviceProfile{
 				DeviceProfile: backend.DeviceProfile{
@@ -395,13 +559,16 @@ func TestNetworkServerAPI(t *testing.T) {
 						868300000,
 						868500000,
 					},
-					RXDelay1:    3,
-					RXDROffset1: 2,
-					RXDataRate2: 5,
-					RXFreq2:     868900000,
+					RXDelay1:       3,
+					RXDROffset1:    2,
+					RXDataRate2:    5,
+					RXFreq2:        868900000,
+					PingSlotPeriod: 32,
+					PingSlotFreq:   868100000,
+					PingSlotDR:     5,
 				},
 			}
-			So(storage.CreateDeviceProfile(common.DB, &dp), ShouldBeNil)
+			So(storage.CreateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
 
 			d := storage.Device{
 				DevEUI:           devEUI,
@@ -409,7 +576,7 @@ func TestNetworkServerAPI(t *testing.T) {
 				RoutingProfileID: rp.RoutingProfileID,
 				ServiceProfileID: sp.ServiceProfileID,
 			}
-			So(storage.CreateDevice(common.DB, &d), ShouldBeNil)
+			So(storage.CreateDevice(config.C.PostgreSQL.DB, &d), ShouldBeNil)
 
 			Convey("Given an item in the device-queue", func() {
 				_, err := api.CreateDeviceQueueItem(ctx, &ns.CreateDeviceQueueItemRequest{
@@ -421,6 +588,27 @@ func TestNetworkServerAPI(t *testing.T) {
 					},
 				})
 				So(err, ShouldBeNil)
+
+				Convey("When calling ActivateDevice when the Device has SkipFCntCheck set to true", func() {
+					d.SkipFCntCheck = true
+					So(storage.UpdateDevice(db, &d), ShouldBeNil)
+
+					_, err := api.ActivateDevice(ctx, &ns.ActivateDeviceRequest{
+						DevEUI:        devEUI[:],
+						DevAddr:       devAddr[:],
+						NwkSKey:       nwkSKey[:],
+						FCntUp:        10,
+						FCntDown:      11,
+						SkipFCntCheck: false,
+					})
+					So(err, ShouldBeNil)
+
+					Convey("Then SkipFCntCheck has been enabled in the activation", func() {
+						ds, err := storage.GetDeviceSession(config.C.Redis.Pool, devEUI)
+						So(err, ShouldBeNil)
+						So(ds.SkipFCntValidation, ShouldBeTrue)
+					})
+				})
 
 				Convey("When calling ActivateDevice", func() {
 					_, err := api.ActivateDevice(ctx, &ns.ActivateDeviceRequest{
@@ -434,32 +622,39 @@ func TestNetworkServerAPI(t *testing.T) {
 					So(err, ShouldBeNil)
 
 					Convey("Then the device-queue was flushed", func() {
-						items, err := storage.GetDeviceQueueItemsForDevEUI(common.DB, d.DevEUI)
+						items, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
 						So(err, ShouldBeNil)
 						So(items, ShouldHaveLength, 0)
 					})
 
 					Convey("Then the device was activated as expected", func() {
-						ds, err := storage.GetDeviceSession(common.RedisPool, devEUI)
+						ds, err := storage.GetDeviceSession(config.C.Redis.Pool, devEUI)
 						So(err, ShouldBeNil)
 						So(ds, ShouldResemble, storage.DeviceSession{
 							DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
 							ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
 							RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
 
-							DevAddr:            devAddr,
-							DevEUI:             devEUI,
-							NwkSKey:            nwkSKey,
-							FCntUp:             10,
-							FCntDown:           11,
-							SkipFCntValidation: true,
-							EnabledChannels:    common.Band.GetUplinkChannels(),
-							ChannelFrequencies: []int{868100000, 868300000, 868500000},
-							RXDelay:            3,
-							RX1DROffset:        2,
-							RX2DR:              5,
-							RX2Frequency:       868900000,
-							MaxSupportedDR:     6,
+							DevAddr:               devAddr,
+							DevEUI:                devEUI,
+							NwkSKey:               nwkSKey,
+							FCntUp:                10,
+							FCntDown:              11,
+							SkipFCntValidation:    true,
+							EnabledUplinkChannels: config.C.NetworkServer.Band.Band.GetEnabledUplinkChannelIndices(),
+							ChannelFrequencies:    []int{868100000, 868300000, 868500000},
+							ExtraUplinkChannels:   map[int]band.Channel{},
+							RXDelay:               3,
+							RX1DROffset:           2,
+							RX2DR:                 5,
+							RX2Frequency:          868900000,
+							MaxSupportedDR:        6,
+
+							LastDevStatusMargin: 127,
+							PingSlotNb:          128,
+							PingSlotDR:          5,
+							PingSlotFrequency:   868100000,
+							NbTrans:             1,
 						})
 					})
 
@@ -516,7 +711,7 @@ func TestNetworkServerAPI(t *testing.T) {
 						})
 						So(err, ShouldBeNil)
 
-						items, err := storage.GetDeviceQueueItemsForDevEUI(common.DB, d.DevEUI)
+						items, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
 						So(err, ShouldBeNil)
 						So(items, ShouldHaveLength, 1)
 
@@ -530,40 +725,100 @@ func TestNetworkServerAPI(t *testing.T) {
 						})
 						So(grpc.Code(err), ShouldEqual, codes.NotFound)
 
-						items, err = storage.GetDeviceQueueItemsForDevEUI(common.DB, d.DevEUI)
+						items, err = storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
 						So(err, ShouldBeNil)
 						So(items, ShouldHaveLength, 0)
 					})
 
-					Convey("When calling EnqueueDownlinkMACCommand", func() {
+					Convey("When calling CreateMACCommandQueueItem", func() {
 						mac := lorawan.MACCommand{
 							CID: lorawan.RXParamSetupReq,
-							Payload: &lorawan.RX2SetupReqPayload{
+							Payload: &lorawan.RXParamSetupReqPayload{
 								Frequency: 868100000,
 							},
 						}
 						b, err := mac.MarshalBinary()
 						So(err, ShouldBeNil)
 
-						_, err = api.EnqueueDownlinkMACCommand(ctx, &ns.EnqueueDownlinkMACCommandRequest{
-							DevEUI:     devEUI[:],
-							FrmPayload: true,
-							Cid:        uint32(lorawan.RXParamSetupReq),
-							Commands:   [][]byte{b},
+						_, err = api.CreateMACCommandQueueItem(ctx, &ns.CreateMACCommandQueueItemRequest{
+							DevEUI:   devEUI[:],
+							Cid:      uint32(lorawan.RXParamSetupReq),
+							Commands: [][]byte{b},
 						})
 						So(err, ShouldBeNil)
 
 						Convey("Then the mac-command has been added to the queue", func() {
-							queue, err := maccommand.ReadQueueItems(common.RedisPool, devEUI)
+							queue, err := storage.GetMACCommandQueueItems(config.C.Redis.Pool, devEUI)
 							So(err, ShouldBeNil)
-							So(queue, ShouldResemble, []maccommand.Block{
+							So(queue, ShouldResemble, []storage.MACCommandBlock{
 								{
 									CID:         lorawan.RXParamSetupReq,
-									FRMPayload:  true,
 									External:    true,
 									MACCommands: []lorawan.MACCommand{mac},
 								},
 							})
+						})
+					})
+				})
+			})
+
+			Convey("Given the device is in Class-B mode", func() {
+				dp.SupportsClassB = true
+				dp.ClassBTimeout = 30
+				So(storage.UpdateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
+
+				ds := storage.DeviceSession{
+					DevEUI:       d.DevEUI,
+					BeaconLocked: true,
+					PingSlotNb:   1,
+				}
+				So(storage.SaveDeviceSession(config.C.Redis.Pool, ds), ShouldBeNil)
+
+				Convey("When calling CreateDeviceQueueItem", func() {
+					_, err := api.CreateDeviceQueueItem(ctx, &ns.CreateDeviceQueueItemRequest{
+						Item: &ns.DeviceQueueItem{
+							DevEUI:     d.DevEUI[:],
+							FrmPayload: []byte{1, 2, 3, 4},
+							FCnt:       10,
+							FPort:      20,
+							Confirmed:  true,
+						},
+					})
+					So(err, ShouldBeNil)
+
+					Convey("Then the GPS epoch timestamp and timeout are set", func() {
+						queueItems, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
+						So(err, ShouldBeNil)
+						So(queueItems, ShouldHaveLength, 1)
+
+						So(queueItems[0].EmitAtTimeSinceGPSEpoch, ShouldNotBeNil)
+						So(queueItems[0].TimeoutAfter, ShouldNotBeNil)
+
+						emitAt := time.Time(gps.NewFromTimeSinceGPSEpoch(*queueItems[0].EmitAtTimeSinceGPSEpoch))
+						So(emitAt.After(time.Now()), ShouldBeTrue)
+
+						So(queueItems[0].TimeoutAfter.Equal(emitAt.Add(time.Second*time.Duration(dp.ClassBTimeout))), ShouldBeTrue)
+					})
+
+					Convey("When calling enqueueing a second item", func() {
+						_, err := api.CreateDeviceQueueItem(ctx, &ns.CreateDeviceQueueItemRequest{
+							Item: &ns.DeviceQueueItem{
+								DevEUI:     d.DevEUI[:],
+								FrmPayload: []byte{1, 2, 3, 4},
+								FCnt:       11,
+								FPort:      20,
+								Confirmed:  true,
+							},
+						})
+						So(err, ShouldBeNil)
+
+						Convey("Then the GPS timestamp occurs after the first queue item", func() {
+							queueItems, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
+							So(err, ShouldBeNil)
+							So(queueItems, ShouldHaveLength, 2)
+							So(queueItems[0].EmitAtTimeSinceGPSEpoch, ShouldNotBeNil)
+							So(queueItems[1].EmitAtTimeSinceGPSEpoch, ShouldNotBeNil)
+							So(*queueItems[1].EmitAtTimeSinceGPSEpoch, ShouldBeGreaterThan, *queueItems[0].EmitAtTimeSinceGPSEpoch)
 						})
 					})
 				})
@@ -675,17 +930,6 @@ func TestNetworkServerAPI(t *testing.T) {
 				So(resp.LastSeenAt, ShouldEqual, "")
 			})
 
-			Convey("Then ListGateways returns the gateway", func() {
-				resp, err := api.ListGateways(ctx, &ns.ListGatewayRequest{
-					Limit:  10,
-					Offset: 0,
-				})
-				So(err, ShouldBeNil)
-				So(resp.TotalCount, ShouldEqual, 1)
-				So(resp.Result, ShouldHaveLength, 1)
-				So(resp.Result[0].Mac, ShouldResemble, []byte{1, 2, 3, 4, 5, 6, 7, 8})
-			})
-
 			Convey("Then DeleteGateway deletes the gateway", func() {
 				_, err := api.DeleteGateway(ctx, &ns.DeleteGatewayRequest{
 					Mac: []byte{1, 2, 3, 4, 5, 6, 7, 8},
@@ -695,30 +939,7 @@ func TestNetworkServerAPI(t *testing.T) {
 				_, err = api.GetGateway(ctx, &ns.GetGatewayRequest{
 					Mac: []byte{1, 2, 3, 4, 5, 6, 7, 8},
 				})
-				So(err, ShouldResemble, grpc.Errorf(codes.NotFound, "gateway does not exist"))
-			})
-
-			Convey("When calling GenerateGatewayToken", func() {
-				common.GatewayServerJWTSecret = "verysecret"
-
-				tokenResp, err := api.GenerateGatewayToken(ctx, &ns.GenerateGatewayTokenRequest{
-					Mac: []byte{1, 2, 3, 4, 5, 6, 7, 8},
-				})
-				So(err, ShouldBeNil)
-
-				Convey("Then a valid JWT token has been returned", func() {
-					token, err := jwt.ParseWithClaims(tokenResp.Token, &auth.Claims{}, func(token *jwt.Token) (interface{}, error) {
-						if token.Header["alg"] != "HS256" {
-							return nil, fmt.Errorf("invalid algorithm %s", token.Header["alg"])
-						}
-						return []byte("verysecret"), nil
-					})
-					So(err, ShouldBeNil)
-					So(token.Valid, ShouldBeTrue)
-					claims, ok := token.Claims.(*auth.Claims)
-					So(ok, ShouldBeTrue)
-					So(claims.MAC, ShouldEqual, lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8})
-				})
+				So(err, ShouldResemble, grpc.Errorf(codes.NotFound, "object does not exist"))
 			})
 
 			Convey("Given some stats for this gateway", func() {
@@ -762,249 +983,127 @@ func TestNetworkServerAPI(t *testing.T) {
 				})
 			})
 
-			Convey("Given 20 logs for two different DevEUIs", func() {
-				now := time.Now()
-				rxInfoSet := []gw.RXInfo{
-					{
-						MAC:       lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
-						Time:      &now,
-						Timestamp: 1234,
-						Frequency: 868100000,
-						Channel:   1,
-						RFChain:   1,
-						CRCStatus: 1,
-						CodeRate:  "4/5",
-						RSSI:      110,
-						LoRaSNR:   5.5,
-						Size:      10,
-						DataRate: band.DataRate{
-							Modulation:   band.LoRaModulation,
-							SpreadFactor: 12,
-							Bandwidth:    125,
-						},
-					},
-				}
-				ts := uint32(12345)
-				txInfo := gw.TXInfo{
-					MAC:         lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
-					Immediately: true,
-					Timestamp:   &ts,
-					Frequency:   868100000,
-					Power:       14,
-					CodeRate:    "4/5",
-					DataRate: band.DataRate{
-						Modulation:   band.LoRaModulation,
-						SpreadFactor: 12,
-						Bandwidth:    125,
-					},
-				}
-				devEUI1 := lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8}
-				devEUI2 := lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1}
-				phy := lorawan.PHYPayload{
-					MHDR: lorawan.MHDR{
-						MType: lorawan.UnconfirmedDataUp,
-						Major: lorawan.LoRaWANR1,
-					},
-					MACPayload: &lorawan.MACPayload{
-						FHDR: lorawan.FHDR{
-							DevAddr: lorawan.DevAddr{1, 2, 3, 4},
-							FCnt:    1,
-						},
-					},
-				}
-
-				rxBytes, err := json.Marshal(rxInfoSet)
-				So(err, ShouldBeNil)
-				txBytes, err := json.Marshal(txInfo)
-				So(err, ShouldBeNil)
-				phyBytes, err := phy.MarshalBinary()
-				So(err, ShouldBeNil)
-
-				for i := 0; i < 10; i++ {
-					frameLog := node.FrameLog{
-						DevEUI:     devEUI1,
-						RXInfoSet:  &rxBytes,
-						TXInfo:     &txBytes,
-						PHYPayload: phyBytes,
-					}
-					So(node.CreateFrameLog(db, &frameLog), ShouldBeNil)
-
-					frameLog.DevEUI = devEUI2
-					frameLog.TXInfo = nil
-					So(node.CreateFrameLog(db, &frameLog), ShouldBeNil)
-				}
-
-				Convey("Then GetFrameLogsForDevEUI returns the expected logs", func() {
-					resp, err := api.GetFrameLogsForDevEUI(ctx, &ns.GetFrameLogsForDevEUIRequest{
-						DevEUI: devEUI1[:],
-						Limit:  1,
-						Offset: 0,
-					})
-					So(err, ShouldBeNil)
-					So(resp.TotalCount, ShouldEqual, 10)
-					So(resp.Result, ShouldHaveLength, 1)
-					So(resp.Result[0].CreatedAt, ShouldNotEqual, "")
-					resp.Result[0].CreatedAt = ""
-					So(resp.Result[0], ShouldResemble, &ns.FrameLog{
-						PhyPayload: phyBytes,
-						TxInfo: &ns.TXInfo{
-							CodeRate:    "4/5",
-							Frequency:   868100000,
-							Immediately: true,
-							Mac:         []byte{1, 2, 3, 4, 5, 6, 7, 8},
-							Power:       14,
-							Timestamp:   12345,
-							DataRate: &ns.DataRate{
-								Modulation:   "LORA",
-								BandWidth:    125,
-								SpreadFactor: 12,
+			Convey("When creating a gateway-profile object", func() {
+				req := ns.CreateGatewayProfileRequest{
+					GatewayProfile: &ns.GatewayProfile{
+						Channels: []uint32{0, 1, 2},
+						ExtraChannels: []*ns.GatewayProfileExtraChannel{
+							{
+								Modulation:       ns.Modulation_LORA,
+								Frequency:        868700000,
+								Bandwidth:        125,
+								SpreadingFactors: []uint32{10, 11, 12},
+							},
+							{
+								Modulation: ns.Modulation_FSK,
+								Frequency:  868900000,
+								Bandwidth:  125,
+								Bitrate:    50000,
 							},
 						},
-						RxInfoSet: []*ns.RXInfo{
+					},
+				}
+				createResp, err := api.CreateGatewayProfile(ctx, &req)
+				So(err, ShouldBeNil)
+				So(createResp.GatewayProfileID, ShouldNotEqual, "")
+
+				Convey("Then it can be retrieved", func() {
+					req.GatewayProfile.GatewayProfileID = createResp.GatewayProfileID
+
+					getResp, err := api.GetGatewayProfile(ctx, &ns.GetGatewayProfileRequest{
+						GatewayProfileID: createResp.GatewayProfileID,
+					})
+					So(err, ShouldBeNil)
+					So(getResp.GatewayProfile, ShouldResemble, &ns.GatewayProfile{
+						GatewayProfileID: createResp.GatewayProfileID,
+						Channels:         []uint32{0, 1, 2},
+						ExtraChannels: []*ns.GatewayProfileExtraChannel{
 							{
-								Channel:   1,
-								CodeRate:  "4/5",
-								Frequency: 868100000,
-								LoRaSNR:   5.5,
-								Rssi:      110,
-								Time:      now.Format(time.RFC3339Nano),
-								Timestamp: 1234,
-								Mac:       []byte{1, 2, 3, 4, 5, 6, 7, 8},
-								DataRate: &ns.DataRate{
-									Modulation:   "LORA",
-									BandWidth:    125,
-									SpreadFactor: 12,
-								},
+								Modulation:       ns.Modulation_LORA,
+								Frequency:        868700000,
+								Bandwidth:        125,
+								SpreadingFactors: []uint32{10, 11, 12},
+							},
+							{
+								Modulation: ns.Modulation_FSK,
+								Frequency:  868900000,
+								Bandwidth:  125,
+								Bitrate:    50000,
 							},
 						},
 					})
 				})
 
-				Convey("When calling CreateChannelConfiguration", func() {
-					cfResp, err := api.CreateChannelConfiguration(ctx, &ns.CreateChannelConfigurationRequest{
-						Name:     "test-config",
-						Channels: []int32{0, 1, 2},
+				Convey("Then it can be updated", func() {
+					updateReq := ns.UpdateGatewayProfileRequest{
+						GatewayProfile: &ns.GatewayProfile{
+							GatewayProfileID: createResp.GatewayProfileID,
+							Channels:         []uint32{0, 1},
+							ExtraChannels: []*ns.GatewayProfileExtraChannel{
+								{
+									Modulation: ns.Modulation_FSK,
+									Frequency:  868900000,
+									Bandwidth:  125,
+									Bitrate:    50000,
+								},
+								{
+									Modulation:       ns.Modulation_LORA,
+									Frequency:        868700000,
+									Bandwidth:        125,
+									SpreadingFactors: []uint32{10, 11, 12},
+								},
+							},
+						},
+					}
+					_, err := api.UpdateGatewayProfile(ctx, &updateReq)
+					So(err, ShouldBeNil)
+
+					resp, err := api.GetGatewayProfile(ctx, &ns.GetGatewayProfileRequest{
+						GatewayProfileID: createResp.GatewayProfileID,
 					})
 					So(err, ShouldBeNil)
-					So(cfResp.Id, ShouldNotEqual, 0)
-
-					Convey("Then the channel-configuration has been created", func() {
-						cf, err := api.GetChannelConfiguration(ctx, &ns.GetChannelConfigurationRequest{
-							Id: cfResp.Id,
-						})
-						So(err, ShouldBeNil)
-						So(cf.Name, ShouldEqual, "test-config")
-						So(cf.Channels, ShouldResemble, []int32{0, 1, 2})
-						So(cf.CreatedAt, ShouldNotEqual, "")
-						So(cf.UpdatedAt, ShouldNotEqual, "")
-
-						Convey("Then ListChannelConfigurations returns the channel-configuration", func() {
-							cfs, err := api.ListChannelConfigurations(ctx, &ns.ListChannelConfigurationsRequest{})
-							So(err, ShouldBeNil)
-							So(cfs.Result, ShouldHaveLength, 1)
-							So(cfs.Result[0], ShouldResemble, cf)
-						})
-
-						Convey("Then UpdateChannelConfiguration updates the channel-configuration", func() {
-							_, err := api.UpdateChannelConfiguration(ctx, &ns.UpdateChannelConfigurationRequest{
-								Id:       cfResp.Id,
-								Name:     "updated-channel-conf",
-								Channels: []int32{0, 1},
-							})
-							So(err, ShouldBeNil)
-
-							cf2, err := api.GetChannelConfiguration(ctx, &ns.GetChannelConfigurationRequest{
-								Id: cfResp.Id,
-							})
-							So(err, ShouldBeNil)
-							So(cf2.Name, ShouldEqual, "updated-channel-conf")
-							So(cf2.Channels, ShouldResemble, []int32{0, 1})
-							So(cf2.CreatedAt, ShouldEqual, cf.CreatedAt)
-							So(cf2.UpdatedAt, ShouldNotEqual, "")
-							So(cf2.UpdatedAt, ShouldNotEqual, cf.UpdatedAt)
-						})
+					So(resp.GatewayProfile, ShouldResemble, &ns.GatewayProfile{
+						GatewayProfileID: createResp.GatewayProfileID,
+						Channels:         []uint32{0, 1},
+						ExtraChannels: []*ns.GatewayProfileExtraChannel{
+							{
+								Modulation: ns.Modulation_FSK,
+								Frequency:  868900000,
+								Bandwidth:  125,
+								Bitrate:    50000,
+							},
+							{
+								Modulation:       ns.Modulation_LORA,
+								Frequency:        868700000,
+								Bandwidth:        125,
+								SpreadingFactors: []uint32{10, 11, 12},
+							},
+						},
 					})
+				})
 
-					Convey("Then the channel-configuration can be assigned to the gateway", func() {
-						req := ns.UpdateGatewayRequest{
-							Mac:                    []byte{1, 2, 3, 4, 5, 6, 7, 8},
-							Name:                   "test-gateway-updated",
-							Description:            "garden gateway",
-							Latitude:               1.1235,
-							Longitude:              1.1236,
-							Altitude:               15.7,
-							ChannelConfigurationID: cfResp.Id,
-						}
-						_, err := api.UpdateGateway(ctx, &req)
-						So(err, ShouldBeNil)
-
-						gw, err := api.GetGateway(ctx, &ns.GetGatewayRequest{
-							Mac: []byte{1, 2, 3, 4, 5, 6, 7, 8},
-						})
-						So(err, ShouldBeNil)
-						So(gw.ChannelConfigurationID, ShouldEqual, cfResp.Id)
+				Convey("Then it can be deleted", func() {
+					_, err := api.DeleteGatewayProfile(ctx, &ns.DeleteGatewayProfileRequest{
+						GatewayProfileID: createResp.GatewayProfileID,
 					})
+					So(err, ShouldBeNil)
 
-					Convey("Then DeleteChannelConfiguration deletes the channel-configuration", func() {
-						_, err := api.DeleteChannelConfiguration(ctx, &ns.DeleteChannelConfigurationRequest{
-							Id: cfResp.Id,
-						})
-						So(err, ShouldBeNil)
-						_, err = api.GetChannelConfiguration(ctx, &ns.GetChannelConfigurationRequest{
-							Id: cfResp.Id,
-						})
-						So(err, ShouldNotBeNil)
-						So(grpc.Code(err), ShouldEqual, codes.NotFound)
+					_, err = api.DeleteGatewayProfile(ctx, &ns.DeleteGatewayProfileRequest{
+						GatewayProfileID: createResp.GatewayProfileID,
 					})
+					So(err, ShouldNotBeNil)
+					So(grpc.Code(err), ShouldEqual, codes.NotFound)
+				})
+			})
 
-					Convey("Then CreateExtraChannel creates an extra channel-configuration channel", func() {
-						ecRes, err := api.CreateExtraChannel(ctx, &ns.CreateExtraChannelRequest{
-							ChannelConfigurationID: cfResp.Id,
-							Modulation:             ns.Modulation_LORA,
-							Frequency:              867100000,
-							BandWidth:              125,
-							SpreadFactors:          []int32{0, 1, 2, 3, 4, 5},
-						})
-						So(err, ShouldBeNil)
-						So(ecRes.Id, ShouldNotEqual, 0)
+			Convey("Then GetVersion returns the expected value", func() {
+				config.Version = "1.2.3"
 
-						Convey("Then UpdateExtraChannel updates this extra channel", func() {
-							_, err := api.UpdateExtraChannel(ctx, &ns.UpdateExtraChannelRequest{
-								Id: ecRes.Id,
-								ChannelConfigurationID: cfResp.Id,
-								Modulation:             ns.Modulation_LORA,
-								Frequency:              867300000,
-								BandWidth:              250,
-								SpreadFactors:          []int32{5},
-							})
-							So(err, ShouldBeNil)
-
-							extraChans, err := api.GetExtraChannelsForChannelConfigurationID(ctx, &ns.GetExtraChannelsForChannelConfigurationIDRequest{
-								Id: cfResp.Id,
-							})
-							So(err, ShouldBeNil)
-							So(extraChans.Result, ShouldHaveLength, 1)
-							So(extraChans.Result[0].Modulation, ShouldEqual, ns.Modulation_LORA)
-							So(extraChans.Result[0].Frequency, ShouldEqual, 867300000)
-							So(extraChans.Result[0].Bandwidth, ShouldEqual, 250)
-							So(extraChans.Result[0].SpreadFactors, ShouldResemble, []int32{5})
-							So(extraChans.Result[0].CreatedAt, ShouldNotEqual, "")
-							So(extraChans.Result[0].UpdatedAt, ShouldNotEqual, "")
-						})
-
-						Convey("Then DeleteExtraChannel deletes this extra channel", func() {
-							_, err := api.DeleteExtraChannel(ctx, &ns.DeleteExtraChannelRequest{
-								Id: ecRes.Id,
-							})
-							So(err, ShouldBeNil)
-
-							extraChans, err := api.GetExtraChannelsForChannelConfigurationID(ctx, &ns.GetExtraChannelsForChannelConfigurationIDRequest{
-								Id: cfResp.Id,
-							})
-							So(err, ShouldBeNil)
-							So(extraChans.Result, ShouldHaveLength, 0)
-						})
-					})
+				resp, err := api.GetVersion(ctx, &ns.GetVersionRequest{})
+				So(err, ShouldBeNil)
+				So(resp, ShouldResemble, &ns.GetVersionResponse{
+					Version: "1.2.3",
+					Region:  ns.Region_EU868,
 				})
 			})
 		})

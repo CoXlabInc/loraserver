@@ -4,29 +4,31 @@ import (
 	"context"
 	"time"
 
+	"github.com/brocaar/loraserver/internal/gps"
+
 	"github.com/brocaar/loraserver/api/as"
+	"github.com/brocaar/loraserver/internal/config"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/brocaar/loraserver/internal/common"
 	"github.com/brocaar/lorawan"
 )
 
 // DeviceQueueItem represents an item in the device queue (downlink).
 type DeviceQueueItem struct {
-	ID           int64         `db:"id"`
-	CreatedAt    time.Time     `db:"created_at"`
-	UpdatedAt    time.Time     `db:"updated_at"`
-	DevEUI       lorawan.EUI64 `db:"dev_eui"`
-	FRMPayload   []byte        `db:"frm_payload"`
-	FCnt         uint32        `db:"f_cnt"`
-	FPort        uint8         `db:"f_port"`
-	Confirmed    bool          `db:"confirmed"`
-	IsPending    bool          `db:"is_pending"`
-	EmitAt       *time.Time    `db:"emit_at"`
-	TimeoutAfter *time.Time    `db:"timeout_after"`
+	ID                      int64          `db:"id"`
+	CreatedAt               time.Time      `db:"created_at"`
+	UpdatedAt               time.Time      `db:"updated_at"`
+	DevEUI                  lorawan.EUI64  `db:"dev_eui"`
+	FRMPayload              []byte         `db:"frm_payload"`
+	FCnt                    uint32         `db:"f_cnt"`
+	FPort                   uint8          `db:"f_port"`
+	Confirmed               bool           `db:"confirmed"`
+	IsPending               bool           `db:"is_pending"`
+	EmitAtTimeSinceGPSEpoch *time.Duration `db:"emit_at_time_since_gps_epoch"`
+	TimeoutAfter            *time.Time     `db:"timeout_after"`
 }
 
 // CreateDeviceQueueItem adds the given item to the device queue.
@@ -44,7 +46,7 @@ func CreateDeviceQueueItem(db sqlx.Queryer, qi *DeviceQueueItem) error {
             f_cnt,
             f_port,
             confirmed,
-            emit_at,
+            emit_at_time_since_gps_epoch,
             is_pending,
             timeout_after
         ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -56,7 +58,7 @@ func CreateDeviceQueueItem(db sqlx.Queryer, qi *DeviceQueueItem) error {
 		qi.FCnt,
 		qi.FPort,
 		qi.Confirmed,
-		qi.EmitAt,
+		qi.EmitAtTimeSinceGPSEpoch,
 		qi.IsPending,
 		qi.TimeoutAfter,
 	)
@@ -95,7 +97,7 @@ func UpdateDeviceQueueItem(db sqlx.Execer, qi *DeviceQueueItem) error {
             f_cnt = $5,
             f_port = $6,
             confirmed = $7,
-            emit_at = $8,
+            emit_at_time_since_gps_epoch = $8,
             is_pending = $9,
             timeout_after = $10
         where
@@ -107,7 +109,7 @@ func UpdateDeviceQueueItem(db sqlx.Execer, qi *DeviceQueueItem) error {
 		qi.FCnt,
 		qi.FPort,
 		qi.Confirmed,
-		qi.EmitAt,
+		qi.EmitAtTimeSinceGPSEpoch,
 		qi.IsPending,
 		qi.TimeoutAfter,
 	)
@@ -123,8 +125,11 @@ func UpdateDeviceQueueItem(db sqlx.Execer, qi *DeviceQueueItem) error {
 	}
 
 	log.WithFields(log.Fields{
-		"f_cnt":   qi.FCnt,
-		"dev_eui": qi.DevEUI,
+		"f_cnt":                        qi.FCnt,
+		"dev_eui":                      qi.DevEUI,
+		"is_pending":                   qi.IsPending,
+		"emit_at_time_since_gps_epoch": qi.EmitAtTimeSinceGPSEpoch,
+		"timeout_after":                qi.TimeoutAfter,
 	}).Info("device-queue item updated")
 
 	return nil
@@ -263,7 +268,7 @@ func GetNextDeviceQueueItemForDevEUIMaxPayloadSizeAndFCnt(db sqlx.Ext, devEUI lo
 			if err != nil {
 				return DeviceQueueItem{}, errors.Wrap(err, "get routing-profile error")
 			}
-			asClient, err := common.ApplicationServerPool.Get(rp.ASID)
+			asClient, err := config.C.ApplicationServer.Pool.Get(rp.ASID, []byte(rp.CACert), []byte(rp.TLSCert), []byte(rp.TLSKey))
 			if err != nil {
 				return DeviceQueueItem{}, errors.Wrap(err, "get application-server client error")
 			}
@@ -332,11 +337,13 @@ func GetNextDeviceQueueItemForDevEUIMaxPayloadSizeAndFCnt(db sqlx.Ext, devEUI lo
 	}
 }
 
-// GetDevicesWithClassCDeviceQueueItems returns a slice of devices that qualify
+// GetDevicesWithClassBOrClassCDeviceQueueItems returns a slice of devices that qualify
 // for downlink Class-C transmission.
 // The device records will be locked for update so that multiple instances can
 // run this query in parallel without the risk of duplicate scheduling.
-func GetDevicesWithClassCDeviceQueueItems(db sqlx.Ext, count int) ([]Device, error) {
+func GetDevicesWithClassBOrClassCDeviceQueueItems(db sqlx.Ext, count int) ([]Device, error) {
+	gpsEpochScheduleTime := gps.Time(time.Now().Add(config.ClassCScheduleInterval * 2)).TimeSinceGPSEpoch()
+
 	var devices []Device
 	err := sqlx.Select(db, &devices, `
         select
@@ -345,8 +352,10 @@ func GetDevicesWithClassCDeviceQueueItems(db sqlx.Ext, count int) ([]Device, err
             device d
         inner join device_profile dp
             on dp.device_profile_id = d.device_profile_id
-        where
-            dp.supports_class_c = true
+        where (
+            	dp.supports_class_c = true
+            	or dp.supports_class_b = true
+            )
             -- we want devices with queue items
             and exists (
                 select
@@ -355,6 +364,13 @@ func GetDevicesWithClassCDeviceQueueItems(db sqlx.Ext, count int) ([]Device, err
                     device_queue dq
                 where
                     dq.dev_eui = d.dev_eui
+                    and (
+                    	dp.supports_class_c = true
+                    	or (
+                    		dp.supports_class_b = true
+                    		and dq.emit_at_time_since_gps_epoch <= $2
+                    	)
+                    )
             )
             -- we don't want device with pending queue items that did not yet
             -- timeout
@@ -373,10 +389,31 @@ func GetDevicesWithClassCDeviceQueueItems(db sqlx.Ext, count int) ([]Device, err
         limit $1
         for update of d skip locked`,
 		count,
+		gpsEpochScheduleTime,
 	)
 	if err != nil {
 		return nil, handlePSQLError(err, "select error")
 	}
 
 	return devices, nil
+}
+
+// GetMaxEmitAtTimeSinceGPSEpochForDevEUI returns the maximum / last GPS
+// epoch scheduling timestamp for the given DevEUI.
+func GetMaxEmitAtTimeSinceGPSEpochForDevEUI(db sqlx.Queryer, devEUI lorawan.EUI64) (time.Duration, error) {
+	var timeSinceGPSEpoch time.Duration
+	err := sqlx.Get(db, &timeSinceGPSEpoch, `
+		select
+			coalesce(max(emit_at_time_since_gps_epoch), 0)
+		from
+			device_queue
+		where
+			dev_eui = $1`,
+		devEUI,
+	)
+	if err != nil {
+		return 0, handlePSQLError(err, "select error")
+	}
+
+	return timeSinceGPSEpoch, nil
 }

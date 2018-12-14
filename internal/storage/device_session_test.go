@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"testing"
 
+	. "github.com/smartystreets/goconvey/convey"
+
 	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/lorawan"
-	. "github.com/smartystreets/goconvey/convey"
+	"github.com/brocaar/lorawan/band"
 )
 
 func TestGetRandomDevAddr(t *testing.T) {
@@ -94,8 +97,10 @@ func TestDeviceSession(t *testing.T) {
 
 		Convey("Given a device-session", func() {
 			s := DeviceSession{
-				DevAddr: lorawan.DevAddr{1, 2, 3, 4},
-				DevEUI:  lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+				DevAddr:             lorawan.DevAddr{1, 2, 3, 4},
+				DevEUI:              lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
+				ExtraUplinkChannels: map[int]band.Channel{},
+				RX2Frequency:        869525000,
 			}
 
 			Convey("When getting a non-existing device-session", func() {
@@ -130,22 +135,24 @@ func TestDeviceSession(t *testing.T) {
 			})
 
 			Convey("When calling validateAndGetFullFCntUp", func() {
+				defaults := config.C.NetworkServer.Band.Band.GetDefaults()
+
 				testTable := []struct {
 					ServerFCnt uint32
 					NodeFCnt   uint32
 					FullFCnt   uint32
 					Valid      bool
 				}{
-					{0, 1, 1, true},                                                               // one packet was lost
-					{1, 1, 1, true},                                                               // ideal case, the FCnt has the expected value
-					{2, 1, 0, false},                                                              // old packet received or re-transmission
-					{0, common.Band.MaxFCntGap, 0, false},                                         // gap should be less than MaxFCntGap
-					{0, common.Band.MaxFCntGap - 1, common.Band.MaxFCntGap - 1, true},             // gap is exactly within the allowed MaxFCntGap
-					{65536, common.Band.MaxFCntGap - 1, common.Band.MaxFCntGap - 1 + 65536, true}, // roll-over happened, gap ix exactly within allowed MaxFCntGap
-					{65535, common.Band.MaxFCntGap, 0, false},                                     // roll-over happened, but too many lost frames
-					{65535, 0, 65536, true},                                                       // roll-over happened
-					{65536, 0, 65536, true},                                                       // re-transmission
-					{4294967295, 0, 0, true},                                                      // 32 bit roll-over happened, counter started at 0 again
+					{0, 1, 1, true},                                                         // one packet was lost
+					{1, 1, 1, true},                                                         // ideal case, the FCnt has the expected value
+					{2, 1, 0, false},                                                        // old packet received or re-transmission
+					{0, defaults.MaxFCntGap, 0, false},                                      // gap should be less than MaxFCntGap
+					{0, defaults.MaxFCntGap - 1, defaults.MaxFCntGap - 1, true},             // gap is exactly within the allowed MaxFCntGap
+					{65536, defaults.MaxFCntGap - 1, defaults.MaxFCntGap - 1 + 65536, true}, // roll-over happened, gap ix exactly within allowed MaxFCntGap
+					{65535, defaults.MaxFCntGap, 0, false},                                  // roll-over happened, but too many lost frames
+					{65535, 0, 65536, true},                                                 // roll-over happened
+					{65536, 0, 65536, true},                                                 // re-transmission
+					{4294967295, 0, 0, true},                                                // 32 bit roll-over happened, counter started at 0 again
 				}
 
 				for _, test := range testTable {

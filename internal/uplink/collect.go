@@ -11,7 +11,7 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/models"
 )
 
@@ -52,7 +52,7 @@ func collectAndCallOnce(p *redis.Pool, rxPacket gw.RXPacket, callback func(packe
 
 	// this way we can set a really low DeduplicationDelay for testing, without
 	// the risk that the set already expired in redis on read
-	deduplicationTTL := common.DeduplicationDelay * 2
+	deduplicationTTL := config.C.NetworkServer.DeduplicationDelay * 2
 	if deduplicationTTL < time.Millisecond*200 {
 		deduplicationTTL = time.Millisecond * 200
 	}
@@ -78,10 +78,9 @@ func collectAndCallOnce(p *redis.Pool, rxPacket gw.RXPacket, callback func(packe
 
 	// wait the configured amount of time, more packets might be received
 	// from other gateways
-	time.Sleep(common.DeduplicationDelay)
+	time.Sleep(config.C.NetworkServer.DeduplicationDelay)
 
 	// collect all packets from the set
-	var rxPacketWithRXInfoSet models.RXPacket
 	payloads, err := redis.ByteSlices(c.Do("SMEMBERS", key))
 	if err != nil {
 		return fmt.Errorf("get collect set members error: %s", err)
@@ -90,18 +89,32 @@ func collectAndCallOnce(p *redis.Pool, rxPacket gw.RXPacket, callback func(packe
 		return errors.New("zero items in collect set")
 	}
 
-	for i, b := range payloads {
+	var out models.RXPacket
+	for _, b := range payloads {
 		var packet gw.RXPacket
 		if err := gob.NewDecoder(bytes.NewReader(b)).Decode(&packet); err != nil {
-			return fmt.Errorf("decode rx packet error: %s", err)
+			return errors.Wrap(err, "decode rx packet error")
 		}
 
-		if i == 0 {
-			rxPacketWithRXInfoSet.PHYPayload = packet.PHYPayload
+		out.PHYPayload = packet.PHYPayload
+		out.TXInfo = models.TXInfo{
+			Frequency: packet.RXInfo.Frequency,
+			DataRate:  packet.RXInfo.DataRate,
+			CodeRate:  packet.RXInfo.CodeRate,
 		}
-		rxPacketWithRXInfoSet.RXInfoSet = append(rxPacketWithRXInfoSet.RXInfoSet, packet.RXInfo)
+
+		out.RXInfoSet = append(out.RXInfoSet, models.RXInfo{
+			MAC:               packet.RXInfo.MAC,
+			Time:              packet.RXInfo.Time,
+			TimeSinceGPSEpoch: packet.RXInfo.TimeSinceGPSEpoch,
+			Timestamp:         packet.RXInfo.Timestamp,
+			RSSI:              packet.RXInfo.RSSI,
+			LoRaSNR:           packet.RXInfo.LoRaSNR,
+			Board:             packet.RXInfo.Board,
+			Antenna:           packet.RXInfo.Antenna,
+		})
 	}
 
-	sort.Sort(rxPacketWithRXInfoSet.RXInfoSet)
-	return callback(rxPacketWithRXInfoSet)
+	sort.Sort(out.RXInfoSet)
+	return callback(out)
 }

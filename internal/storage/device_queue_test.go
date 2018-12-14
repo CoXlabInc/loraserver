@@ -5,15 +5,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jmoiron/sqlx"
-
-	"github.com/brocaar/lorawan"
-	"github.com/brocaar/lorawan/backend"
 	"github.com/pkg/errors"
 
 	"github.com/brocaar/loraserver/api/as"
 	"github.com/brocaar/loraserver/internal/common"
+	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/gps"
 	"github.com/brocaar/loraserver/internal/test"
+	"github.com/brocaar/lorawan"
+	"github.com/brocaar/lorawan/backend"
 	. "github.com/smartystreets/goconvey/convey"
 )
 
@@ -23,12 +23,12 @@ func TestDeviceQueue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
+	config.C.PostgreSQL.DB = db
 
 	Convey("Given a clean database", t, func() {
-		test.MustResetDB(common.DB)
+		test.MustResetDB(config.C.PostgreSQL.DB)
 		asClient := test.NewApplicationClient()
-		common.ApplicationServerPool = test.NewApplicationServerPool(asClient)
+		config.C.ApplicationServer.Pool = test.NewApplicationServerPool(asClient)
 
 		Convey("Given a service, device and routing profile and device", func() {
 			sp := ServiceProfile{}
@@ -49,7 +49,8 @@ func TestDeviceQueue(t *testing.T) {
 			So(CreateDevice(db, &d), ShouldBeNil)
 
 			Convey("Given a set of queue items", func() {
-				now := time.Now().UTC().Truncate(time.Millisecond)
+				gpsEpochTS1 := time.Second * 30
+				gpsEpochTS2 := time.Second * 40
 				inOneHour := time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond)
 
 				items := []DeviceQueueItem{
@@ -65,14 +66,14 @@ func TestDeviceQueue(t *testing.T) {
 						FRMPayload: []byte{4, 5, 6},
 						FCnt:       3,
 						FPort:      11,
-						EmitAt:     &now,
+						EmitAtTimeSinceGPSEpoch: &gpsEpochTS1,
 					},
 					{
 						DevEUI:     d.DevEUI,
 						FRMPayload: []byte{7, 8, 9},
 						FCnt:       2,
 						FPort:      12,
-						EmitAt:     &inOneHour,
+						EmitAtTimeSinceGPSEpoch: &gpsEpochTS2,
 					},
 				}
 				for i := range items {
@@ -80,6 +81,12 @@ func TestDeviceQueue(t *testing.T) {
 					items[i].CreatedAt = items[i].UpdatedAt.UTC().Truncate(time.Millisecond)
 					items[i].UpdatedAt = items[i].UpdatedAt.UTC().Truncate(time.Millisecond)
 				}
+
+				Convey("Then GetMaxEmlitAtTimeSinceGPSEpochForDevEUI returns the expected value", func() {
+					d, err := GetMaxEmitAtTimeSinceGPSEpochForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
+					So(err, ShouldBeNil)
+					So(d, ShouldEqual, gpsEpochTS2)
+				})
 
 				Convey("Then GetDeviceQueueItem returns the requested item", func() {
 					qi, err := GetDeviceQueueItem(db, items[0].ID)
@@ -123,10 +130,10 @@ func TestDeviceQueue(t *testing.T) {
 					ts := time.Now().Add(time.Minute)
 					items[0].IsPending = true
 					items[0].TimeoutAfter = &ts
-					So(UpdateDeviceQueueItem(common.DB, &items[0]), ShouldBeNil)
+					So(UpdateDeviceQueueItem(config.C.PostgreSQL.DB, &items[0]), ShouldBeNil)
 
 					Convey("Then GetNextDeviceQueueItemForDevEUI returns does not exist error", func() {
-						_, err := GetNextDeviceQueueItemForDevEUI(common.DB, d.DevEUI)
+						_, err := GetNextDeviceQueueItemForDevEUI(config.C.PostgreSQL.DB, d.DevEUI)
 						So(err, ShouldEqual, ErrDoesNotExist)
 					})
 				})
@@ -184,7 +191,7 @@ func TestDeviceQueue(t *testing.T) {
 					},
 				}
 				for i := range items {
-					So(CreateDeviceQueueItem(common.DB, &items[i]), ShouldBeNil)
+					So(CreateDeviceQueueItem(config.C.PostgreSQL.DB, &items[i]), ShouldBeNil)
 				}
 
 				tests := []struct {
@@ -262,7 +269,7 @@ func TestDeviceQueue(t *testing.T) {
 
 				for i, test := range tests {
 					Convey(fmt.Sprintf("Testing: %s [%d]", test.Name, i), func() {
-						qi, err := GetNextDeviceQueueItemForDevEUIMaxPayloadSizeAndFCnt(common.DB, d.DevEUI, test.MaxFRMPayload, test.FCnt, rp.RoutingProfileID)
+						qi, err := GetNextDeviceQueueItemForDevEUIMaxPayloadSizeAndFCnt(config.C.PostgreSQL.DB, d.DevEUI, test.MaxFRMPayload, test.FCnt, rp.RoutingProfileID)
 						if test.ExpectedHandleError == nil {
 							So(*test.ExpectedDeviceQueueItemID, ShouldEqual, qi.ID)
 							So(err, ShouldBeNil)
@@ -288,30 +295,38 @@ func TestDeviceQueue(t *testing.T) {
 	})
 }
 
+type getDeviceQueueItemsTestCase struct {
+	Name            string
+	GetCallCount    int // the number of Get calls to make, each in a separate db transaction
+	GetCount        int
+	QueueItems      []DeviceQueueItem
+	ExpectedDevEUIs [][]lorawan.EUI64 // slice of EUIs per database transaction
+}
+
 func TestGetDevEUIsWithClassCDeviceQueueItems(t *testing.T) {
 	conf := test.GetConfig()
 	db, err := common.OpenDatabase(conf.PostgresDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
-	common.DB = db
+	config.C.PostgreSQL.DB = db
 
 	Convey("Given a clean database", t, func() {
-		test.MustResetDB(common.DB)
+		test.MustResetDB(config.C.PostgreSQL.DB)
 
-		Convey("Given a service-, class-c device- and routing-profile and two devices", func() {
+		Convey("Given a service-, class-b device- and routing-profile and two devices", func() {
 			sp := ServiceProfile{}
-			So(CreateServiceProfile(common.DB, &sp), ShouldBeNil)
+			So(CreateServiceProfile(config.C.PostgreSQL.DB, &sp), ShouldBeNil)
 
 			rp := RoutingProfile{}
-			So(CreateRoutingProfile(common.DB, &rp), ShouldBeNil)
+			So(CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
 
 			dp := DeviceProfile{
 				DeviceProfile: backend.DeviceProfile{
-					SupportsClassC: true,
+					SupportsClassB: true,
 				},
 			}
-			So(CreateDeviceProfile(common.DB, &dp), ShouldBeNil)
+			So(CreateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
 
 			devices := []Device{
 				{
@@ -328,18 +343,103 @@ func TestGetDevEUIsWithClassCDeviceQueueItems(t *testing.T) {
 				},
 			}
 			for i := range devices {
-				So(CreateDevice(common.DB, &devices[i]), ShouldBeNil)
+				So(CreateDevice(config.C.PostgreSQL.DB, &devices[i]), ShouldBeNil)
+			}
+
+			inTwoSeconds := gps.Time(time.Now().Add(time.Second)).TimeSinceGPSEpoch()
+			inFiveSeconds := gps.Time(time.Now().Add(5 * time.Second)).TimeSinceGPSEpoch()
+
+			tests := []getDeviceQueueItemsTestCase{
+				{
+					Name:         "single pingslot queue item to be scheduled",
+					GetCallCount: 2,
+					GetCount:     1,
+					QueueItems: []DeviceQueueItem{
+						{DevEUI: devices[0].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inTwoSeconds},
+					},
+					ExpectedDevEUIs: [][]lorawan.EUI64{
+						{devices[0].DevEUI},
+						nil,
+					},
+				},
+				{
+					Name:         "single pingslot queue item, not yet to schedule",
+					GetCallCount: 2,
+					GetCount:     1,
+					QueueItems: []DeviceQueueItem{
+						{DevEUI: devices[0].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inFiveSeconds},
+					},
+					ExpectedDevEUIs: [][]lorawan.EUI64{
+						nil,
+						nil,
+					},
+				},
+				{
+					Name:         "two pingslot queue items for two devices (limit 1)",
+					GetCallCount: 2,
+					GetCount:     1,
+					QueueItems: []DeviceQueueItem{
+						{DevEUI: devices[0].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inTwoSeconds},
+						{DevEUI: devices[1].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inTwoSeconds},
+					},
+					ExpectedDevEUIs: [][]lorawan.EUI64{
+						{devices[0].DevEUI},
+						{devices[1].DevEUI},
+					},
+				},
+				{
+					Name:         "two pingslot queue items for two devices (limit 2)",
+					GetCallCount: 2,
+					GetCount:     2,
+					QueueItems: []DeviceQueueItem{
+						{DevEUI: devices[0].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inTwoSeconds},
+						{DevEUI: devices[1].DevEUI, FCnt: 1, FPort: 1, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &inTwoSeconds},
+					},
+					ExpectedDevEUIs: [][]lorawan.EUI64{
+						{devices[0].DevEUI, devices[1].DevEUI},
+						nil,
+					},
+				},
+			}
+
+			runGetDeviceQueueItemsTests(tests)
+		})
+
+		Convey("Given a service-, class-c device- and routing-profile and two devices", func() {
+			sp := ServiceProfile{}
+			So(CreateServiceProfile(config.C.PostgreSQL.DB, &sp), ShouldBeNil)
+
+			rp := RoutingProfile{}
+			So(CreateRoutingProfile(config.C.PostgreSQL.DB, &rp), ShouldBeNil)
+
+			dp := DeviceProfile{
+				DeviceProfile: backend.DeviceProfile{
+					SupportsClassC: true,
+				},
+			}
+			So(CreateDeviceProfile(config.C.PostgreSQL.DB, &dp), ShouldBeNil)
+
+			devices := []Device{
+				{
+					ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
+					DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
+					RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
+					DevEUI:           lorawan.EUI64{1, 1, 1, 1, 1, 1, 1, 1},
+				},
+				{
+					ServiceProfileID: sp.ServiceProfile.ServiceProfileID,
+					DeviceProfileID:  dp.DeviceProfile.DeviceProfileID,
+					RoutingProfileID: rp.RoutingProfile.RoutingProfileID,
+					DevEUI:           lorawan.EUI64{2, 2, 2, 2, 2, 2, 2, 2},
+				},
+			}
+			for i := range devices {
+				So(CreateDevice(config.C.PostgreSQL.DB, &devices[i]), ShouldBeNil)
 			}
 
 			inOneMinute := time.Now().Add(time.Minute)
 
-			tests := []struct {
-				Name            string
-				GetCallCount    int // the number of Get calls to make, each in a separate db transaction
-				GetCount        int
-				QueueItems      []DeviceQueueItem
-				ExpectedDevEUIs [][]lorawan.EUI64 // slice of EUIs per database transaction
-			}{
+			tests := []getDeviceQueueItemsTestCase{
 				{
 					Name:         "single queue item",
 					GetCallCount: 2,
@@ -405,39 +505,43 @@ func TestGetDevEUIsWithClassCDeviceQueueItems(t *testing.T) {
 				},
 			}
 
-			for i, test := range tests {
-				Convey(fmt.Sprintf("testing: %s [%d]", test.Name, i), func() {
-					var transactions []*sqlx.Tx
-					var out [][]lorawan.EUI64
-
-					defer func() {
-						for i := range transactions {
-							transactions[i].Rollback()
-						}
-					}()
-
-					for i := range test.QueueItems {
-						So(CreateDeviceQueueItem(common.DB, &test.QueueItems[i]), ShouldBeNil)
-					}
-
-					for i := 0; i < test.GetCallCount; i++ {
-						tx, err := common.DB.Beginx()
-						So(err, ShouldBeNil)
-						transactions = append(transactions, tx)
-
-						devs, err := GetDevicesWithClassCDeviceQueueItems(tx, test.GetCount)
-						So(err, ShouldBeNil)
-
-						var euis []lorawan.EUI64
-						for i := range devs {
-							euis = append(euis, devs[i].DevEUI)
-						}
-						out = append(out, euis)
-					}
-
-					So(out, ShouldResemble, test.ExpectedDevEUIs)
-				})
-			}
+			runGetDeviceQueueItemsTests(tests)
 		})
 	})
+}
+
+func runGetDeviceQueueItemsTests(tests []getDeviceQueueItemsTestCase) {
+	for i, test := range tests {
+		Convey(fmt.Sprintf("testing: %s [%d]", test.Name, i), func() {
+			var transactions []*common.TxLogger
+			var out [][]lorawan.EUI64
+
+			defer func() {
+				for i := range transactions {
+					transactions[i].Rollback()
+				}
+			}()
+
+			for i := range test.QueueItems {
+				So(CreateDeviceQueueItem(config.C.PostgreSQL.DB, &test.QueueItems[i]), ShouldBeNil)
+			}
+
+			for i := 0; i < test.GetCallCount; i++ {
+				tx, err := config.C.PostgreSQL.DB.Beginx()
+				So(err, ShouldBeNil)
+				transactions = append(transactions, tx)
+
+				devs, err := GetDevicesWithClassBOrClassCDeviceQueueItems(tx, test.GetCount)
+				So(err, ShouldBeNil)
+
+				var euis []lorawan.EUI64
+				for i := range devs {
+					euis = append(euis, devs[i].DevEUI)
+				}
+				out = append(out, euis)
+			}
+
+			So(out, ShouldResemble, test.ExpectedDevEUIs)
+		})
+	}
 }
