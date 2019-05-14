@@ -9,10 +9,12 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/band"
+	"github.com/brocaar/loraserver/internal/downlink"
 	"github.com/brocaar/loraserver/internal/gps"
 	"github.com/brocaar/loraserver/internal/helpers"
 	"github.com/brocaar/loraserver/internal/storage"
+	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/loraserver/internal/uplink"
 	"github.com/brocaar/lorawan"
 )
@@ -22,10 +24,7 @@ type ClassBTestSuite struct {
 }
 
 func (ts *ClassBTestSuite) SetupSuite() {
-	ts.DatabaseTestSuiteBase.SetupSuite()
-
-	config.C.NetworkServer.NetworkSettings.ClassB.PingSlotDR = 2
-	config.C.NetworkServer.NetworkSettings.ClassB.PingSlotFrequency = 868300000
+	ts.IntegrationTestSuite.SetupSuite()
 
 	ts.CreateGateway(storage.Gateway{
 		GatewayID: [8]byte{1, 2, 3, 4, 5, 6, 7, 8},
@@ -49,6 +48,18 @@ func (ts *ClassBTestSuite) SetupSuite() {
 	ts.CreateDevice(storage.Device{
 		DevEUI: lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8},
 	})
+}
+
+func (ts *ClassBTestSuite) SetupTest() {
+	ts.IntegrationTestSuite.SetupTest()
+
+	assert := require.New(ts.T())
+
+	conf := test.GetConfig()
+	conf.NetworkServer.NetworkSettings.ClassB.PingSlotDR = 2
+	conf.NetworkServer.NetworkSettings.ClassB.PingSlotFrequency = 868300000
+
+	assert.NoError(downlink.Setup(conf))
 }
 
 func (ts *ClassBTestSuite) TestUplink() {
@@ -75,7 +86,7 @@ func (ts *ClassBTestSuite) TestUplink() {
 		},
 	}
 	for i := range queueItems {
-		assert.NoError(storage.CreateDeviceQueueItem(ts.DB(), &queueItems[i]))
+		assert.NoError(storage.CreateDeviceQueueItem(storage.DB(), &queueItems[i]))
 	}
 
 	// device-session
@@ -98,7 +109,7 @@ func (ts *ClassBTestSuite) TestUplink() {
 	}
 
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	c0, err := config.C.NetworkServer.Band.Band.GetUplinkChannel(0)
+	c0, err := band.Band().GetUplinkChannel(0)
 	assert.NoError(err)
 
 	rxInfo := gw.UplinkRXInfo{
@@ -111,7 +122,7 @@ func (ts *ClassBTestSuite) TestUplink() {
 	txInfo := gw.UplinkTXInfo{
 		Frequency: uint32(c0.Frequency),
 	}
-	assert.NoError(helpers.SetUplinkTXInfoDataRate(&txInfo, 0, config.C.NetworkServer.Band.Band))
+	assert.NoError(helpers.SetUplinkTXInfoDataRate(&txInfo, 0, band.Band()))
 
 	testTable := []struct {
 		BeforeFunc           func(ds *storage.DeviceSession)
@@ -174,7 +185,7 @@ func (ts *ClassBTestSuite) TestUplink() {
 			}
 
 			// create device-session
-			assert.NoError(storage.SaveDeviceSession(ts.RedisPool(), test.DeviceSession))
+			assert.NoError(storage.SaveDeviceSession(storage.RedisPool(), test.DeviceSession))
 
 			// set MIC
 			assert.NoError(test.PHYPayload.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, test.DeviceSession.FNwkSIntKey, test.DeviceSession.SNwkSIntKey))
@@ -189,19 +200,26 @@ func (ts *ClassBTestSuite) TestUplink() {
 			}
 			assert.NoError(uplink.HandleRXPacket(uplinkFrame))
 
-			ds, err := storage.GetDeviceSession(ts.RedisPool(), test.DeviceSession.DevEUI)
+			ds, err := storage.GetDeviceSession(storage.RedisPool(), test.DeviceSession.DevEUI)
+			assert.NoError(err)
+
+			d, err := storage.GetDevice(storage.DB(), test.DeviceSession.DevEUI)
 			assert.NoError(err)
 
 			assert.Equal(test.ExpectedBeaconLocked, ds.BeaconLocked)
 
 			if test.ExpectedBeaconLocked {
-				queueItems, err := storage.GetDeviceQueueItemsForDevEUI(config.C.PostgreSQL.DB, test.DeviceSession.DevEUI)
+				assert.Equal(storage.DeviceModeB, d.Mode)
+
+				queueItems, err := storage.GetDeviceQueueItemsForDevEUI(storage.DB(), test.DeviceSession.DevEUI)
 				assert.NoError(err)
 
 				for _, qi := range queueItems {
 					assert.NotNil(qi.EmitAtTimeSinceGPSEpoch)
 					assert.NotNil(qi.TimeoutAfter)
 				}
+			} else {
+				assert.Equal(storage.DeviceModeA, d.Mode)
 			}
 		})
 	}
@@ -209,6 +227,9 @@ func (ts *ClassBTestSuite) TestUplink() {
 
 func (ts *ClassBTestSuite) TestDownlink() {
 	assert := require.New(ts.T())
+
+	ts.Device.Mode = storage.DeviceModeB
+	assert.NoError(storage.UpdateDevice(storage.DB(), ts.Device))
 
 	ts.CreateDeviceSession(storage.DeviceSession{
 		DevAddr:     lorawan.DevAddr{1, 2, 3, 4},
@@ -234,10 +255,16 @@ func (ts *ClassBTestSuite) TestDownlink() {
 	txInfo := gw.DownlinkTXInfo{
 		GatewayId:         []byte{1, 2, 1, 2, 1, 2, 1, 2},
 		Frequency:         uint32(ts.DeviceSession.PingSlotFrequency),
-		Power:             int32(config.C.NetworkServer.Band.Band.GetDownlinkTXPower(ts.DeviceSession.PingSlotFrequency)),
+		Power:             int32(band.Band().GetDownlinkTXPower(ts.DeviceSession.PingSlotFrequency)),
 		TimeSinceGpsEpoch: ptypes.DurationProto(emitTime),
+		Timing:            gw.DownlinkTiming_GPS_EPOCH,
+		TimingInfo: &gw.DownlinkTXInfo_GpsEpochTimingInfo{
+			GpsEpochTimingInfo: &gw.GPSEpochTimingInfo{
+				TimeSinceGpsEpoch: ptypes.DurationProto(emitTime),
+			},
+		},
 	}
-	assert.NoError(helpers.SetDownlinkTXInfoDataRate(&txInfo, 2, config.C.NetworkServer.Band.Band))
+	assert.NoError(helpers.SetDownlinkTXInfoDataRate(&txInfo, 2, band.Band()))
 
 	txInfoDefaultFreq := txInfo
 	txInfoDefaultFreq.Frequency = 869525000
@@ -310,24 +337,12 @@ func (ts *ClassBTestSuite) TestDownlink() {
 		},
 		{
 			BeforeFunc: func(tst *DownlinkTest) error {
-				tst.DeviceSession.BeaconLocked = false
-				return nil
-			},
-			Name:          "class-b downlink, but no beacon lock",
-			DeviceSession: *ts.DeviceSession,
-			DeviceQueueItems: []storage.DeviceQueueItem{
-				{DevEUI: ts.Device.DevEUI, FPort: 10, FCnt: 5, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &emitTime},
-			},
-			Assert: []Assertion{
-				AssertFCntUp(8),
-				AssertNFCntDown(5),
-			},
-		},
-		{
-			BeforeFunc: func(tst *DownlinkTest) error {
-				config.C.NetworkServer.NetworkSettings.ClassB.PingSlotFrequency = 0
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.ClassB.PingSlotDR = 2
+				conf.NetworkServer.NetworkSettings.ClassB.PingSlotFrequency = 0
 				tst.DeviceSession.PingSlotFrequency = 0
-				return nil
+
+				return downlink.Setup(conf)
 			},
 			Name:          "class-b downlink, with default band frequency plan",
 			DeviceSession: *ts.DeviceSession,
@@ -357,6 +372,22 @@ func (ts *ClassBTestSuite) TestDownlink() {
 						},
 					},
 				}),
+			},
+		},
+		{
+			BeforeFunc: func(tst *DownlinkTest) error {
+				tst.DeviceSession.BeaconLocked = false
+				ts.Device.Mode = storage.DeviceModeA
+				return storage.UpdateDevice(storage.DB(), ts.Device)
+			},
+			Name:          "class-b downlink, but no beacon lock",
+			DeviceSession: *ts.DeviceSession,
+			DeviceQueueItems: []storage.DeviceQueueItem{
+				{DevEUI: ts.Device.DevEUI, FPort: 10, FCnt: 5, FRMPayload: []byte{1, 2, 3}, EmitAtTimeSinceGPSEpoch: &emitTime},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(8),
+				AssertNFCntDown(5),
 			},
 		},
 	}

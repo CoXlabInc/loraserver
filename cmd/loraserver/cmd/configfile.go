@@ -214,8 +214,10 @@ get_downlink_data_delay="{{ .NetworkServer.GetDownlinkDataDelay }}"
 
   # Disable mac-commands
   #
-  # When set, uplink mac-commands are ignored and the network-server will not
-  # send mac-commands to the devices. This is intended for testing only.
+  # When set to true, LoRa Server will not handle and / or schedule any
+  # mac-commands. However, it is still possible for an external controller
+  # to handle and / or schedule mac-commands. This is intended for testing
+  # only.
   disable_mac_commands={{ .NetworkServer.NetworkSettings.DisableMACCommands }}
 
   # Disable ADR
@@ -354,7 +356,10 @@ get_downlink_data_delay="{{ .NetworkServer.GetDownlinkDataDelay }}"
     #
     # This defines the backend to use for the communication with the gateways.
     # Use the section name of one of the following gateway backends.
-    # E.g. "mqtt" or "gcp_pub_sub".
+	# Valid options are:
+    #  * mqtt
+    #  * gcp_pub_sub
+    #  * azure_iot_hub
     type="{{ .NetworkServer.Gateway.Backend.Type }}"
 
 
@@ -448,6 +453,25 @@ get_downlink_data_delay="{{ .NetworkServer.GetDownlinkDataDelay }}"
     #
     # The retention duration that LoRa Server will set on the uplink subscription.
     uplink_retention_duration="{{ .NetworkServer.Gateway.Backend.GCPPubSub.UplinkRetentionDuration }}"
+
+
+    # Azure IoT Hub backend.
+    #
+    # Use this backend when the LoRa Gateway Bridge is configured to connect
+    # to the Azure IoT Hub MQTT broker.
+    [network_server.gateway.backend.azure_iot_hub]
+
+    # Events connection string.
+    #
+    # This connection string must point to the Service Bus Queue to which the
+    # IoT Hub is forwarding the (uplink) gateway events.
+    events_connection_string="{{ .NetworkServer.Gateway.Backend.AzureIoTHub.EventsConnectionString }}"
+
+    # Commands connection string.
+    #
+    # This connection string must point to the IoT Hub and is used by LoRa Server
+    # for sending commands to the gateways.
+    commands_connection_string="{{ .NetworkServer.Gateway.Backend.AzureIoTHub.CommandsConnectionString }}"
 
 
   # Geolocation settings.

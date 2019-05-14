@@ -1,4 +1,4 @@
-//go:generate protoc -I=. -I=$GOPATH/src --go_out=plugins=grpc:. device_session.proto
+//go:generate protoc -I=. -I=../.. --go_out=. device_session.proto
 
 package storage
 
@@ -16,10 +16,10 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	commonPB "github.com/brocaar/loraserver/api/common"
-	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/api/common"
+	"github.com/brocaar/loraserver/internal/band"
 	"github.com/brocaar/lorawan"
-	"github.com/brocaar/lorawan/band"
+	loraband "github.com/brocaar/lorawan/band"
 )
 
 const (
@@ -127,20 +127,16 @@ type DeviceSession struct {
 	// by the node, or 0 when not set.
 	MaxSupportedTXPowerIndex int
 
-	// MaxSupportedDR defines the maximum supported DR index by the node,
-	// or 0 when not set.
-	MaxSupportedDR int
-
 	// NbTrans defines the number of transmissions for each unconfirmed uplink
 	// frame. In case of 0, the default value is used.
 	// This value is controlled by the ADR engine.
 	NbTrans uint8
 
-	EnabledChannels       []int                // deprecated, migrated by GetDeviceSession
-	EnabledUplinkChannels []int                // channels that are activated on the node
-	ExtraUplinkChannels   map[int]band.Channel // extra uplink channels, configured by the user
-	ChannelFrequencies    []int                // frequency of each channel
-	UplinkHistory         []UplinkHistory      // contains the last 20 transmissions
+	EnabledChannels       []int                    // deprecated, migrated by GetDeviceSession
+	EnabledUplinkChannels []int                    // channels that are activated on the node
+	ExtraUplinkChannels   map[int]loraband.Channel // extra uplink channels, configured by the user
+	ChannelFrequencies    []int                    // frequency of each channel
+	UplinkHistory         []UplinkHistory          // contains the last 20 transmissions
 	UplinkGatewayHistory  map[lorawan.EUI64]UplinkGatewayHistory
 
 	// LastDevStatusRequest contains the timestamp when the last device-status
@@ -244,12 +240,12 @@ func (s *DeviceSession) ResetToBootParameters(dp DeviceProfile) {
 	s.TXPowerIndex = 0
 	s.MinSupportedTXPowerIndex = 0
 	s.MaxSupportedTXPowerIndex = 0
-	s.ExtraUplinkChannels = make(map[int]band.Channel)
+	s.ExtraUplinkChannels = make(map[int]loraband.Channel)
 	s.RXDelay = uint8(dp.RXDelay1)
 	s.RX1DROffset = uint8(dp.RXDROffset1)
 	s.RX2DR = uint8(dp.RXDataRate2)
 	s.RX2Frequency = int(dp.RXFreq2)
-	s.EnabledUplinkChannels = config.C.NetworkServer.Band.Band.GetStandardUplinkChannelIndices() // TODO: replace by ServiceProfile.ChannelMask?
+	s.EnabledUplinkChannels = band.Band().GetStandardUplinkChannelIndices() // TODO: replace by ServiceProfile.ChannelMask?
 	s.ChannelFrequencies = channelFrequencies
 	s.PingSlotDR = dp.PingSlotDR
 	s.PingSlotFrequency = int(dp.PingSlotFreq)
@@ -294,7 +290,7 @@ func GetRandomDevAddr(p *redis.Pool, netID lorawan.NetID) (lorawan.DevAddr, erro
 func ValidateAndGetFullFCntUp(s DeviceSession, fCntUp uint32) (uint32, bool) {
 	// we need to compare the difference of the 16 LSB
 	gap := uint32(uint16(fCntUp) - uint16(s.FCntUp%65536))
-	if gap < config.C.NetworkServer.Band.Band.GetDefaults().MaxFCntGap {
+	if gap < band.Band().GetDefaults().MaxFCntGap {
 		return s.FCntUp + gap, true
 	}
 	return 0, false
@@ -311,7 +307,7 @@ func SaveDeviceSession(p *redis.Pool, s DeviceSession) error {
 
 	c := p.Get()
 	defer c.Close()
-	exp := int64(config.C.NetworkServer.DeviceSessionTTL) / int64(time.Millisecond)
+	exp := int64(deviceSessionTTL) / int64(time.Millisecond)
 
 	c.Send("MULTI")
 	c.Send("PSETEX", fmt.Sprintf(deviceSessionKeyTempl, s.DevEUI), exp, b)
@@ -533,7 +529,7 @@ func SaveDeviceGatewayRXInfoSet(p *redis.Pool, rxInfoSet DeviceGatewayRXInfoSet)
 
 	c := p.Get()
 	defer c.Close()
-	exp := int64(config.C.NetworkServer.DeviceSessionTTL / time.Millisecond)
+	exp := int64(deviceSessionTTL / time.Millisecond)
 	_, err = c.Do("PSETEX", fmt.Sprintf(deviceGatewayRXInfoSetKeyTempl, rxInfoSet.DevEUI), exp, b)
 	if err != nil {
 		return errors.Wrap(err, "psetex error")
@@ -658,7 +654,6 @@ func deviceSessionToPB(d DeviceSession) DeviceSessionPB {
 		Adr:                      d.ADR,
 		MinSupportedTxPowerIndex: uint32(d.MinSupportedTXPowerIndex),
 		MaxSupportedTxPowerIndex: uint32(d.MaxSupportedTXPowerIndex),
-		MaxSupportedDr:           uint32(d.MaxSupportedDR),
 		NbTrans:                  uint32(d.NbTrans),
 
 		ExtraUplinkChannels:  make(map[uint32]*DeviceSessionPBChannel),
@@ -681,7 +676,7 @@ func deviceSessionToPB(d DeviceSession) DeviceSessionPB {
 	}
 
 	if d.AppSKeyEvelope != nil {
-		out.AppSKeyEnvelope = &commonPB.KeyEnvelope{
+		out.AppSKeyEnvelope = &common.KeyEnvelope{
 			KekLabel: d.AppSKeyEvelope.KEKLabel,
 			AesKey:   d.AppSKeyEvelope.AESKey,
 		}
@@ -757,10 +752,9 @@ func deviceSessionFromPB(d DeviceSessionPB) DeviceSession {
 		ADR:                      d.Adr,
 		MinSupportedTXPowerIndex: int(d.MinSupportedTxPowerIndex),
 		MaxSupportedTXPowerIndex: int(d.MaxSupportedTxPowerIndex),
-		MaxSupportedDR:           int(d.MaxSupportedDr),
 		NbTrans:                  uint8(d.NbTrans),
 
-		ExtraUplinkChannels:  make(map[int]band.Channel),
+		ExtraUplinkChannels:  make(map[int]loraband.Channel),
 		UplinkGatewayHistory: make(map[lorawan.EUI64]UplinkGatewayHistory),
 
 		BeaconLocked:      d.BeaconLocked,
@@ -803,7 +797,7 @@ func deviceSessionFromPB(d DeviceSessionPB) DeviceSession {
 	}
 
 	for i, c := range d.ExtraUplinkChannels {
-		out.ExtraUplinkChannels[int(i)] = band.Channel{
+		out.ExtraUplinkChannels[int(i)] = loraband.Channel{
 			Frequency: int(c.Frequency),
 			MinDR:     int(c.MinDr),
 			MaxDR:     int(c.MaxDr),

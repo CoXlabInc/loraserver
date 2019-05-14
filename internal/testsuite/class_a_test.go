@@ -10,14 +10,16 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/brocaar/loraserver/api/as"
-	commonPB "github.com/brocaar/loraserver/api/common"
+	"github.com/brocaar/loraserver/api/common"
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/nc"
-	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/band"
+	"github.com/brocaar/loraserver/internal/downlink"
 	"github.com/brocaar/loraserver/internal/helpers"
 	"github.com/brocaar/loraserver/internal/storage"
+	"github.com/brocaar/loraserver/internal/test"
+	"github.com/brocaar/loraserver/internal/uplink"
 	"github.com/brocaar/lorawan"
-	"github.com/brocaar/lorawan/band"
 )
 
 func init() {
@@ -38,7 +40,8 @@ type ClassATestSuite struct {
 }
 
 func (ts *ClassATestSuite) SetupSuite() {
-	ts.DatabaseTestSuiteBase.SetupSuite()
+	ts.IntegrationTestSuite.SetupSuite()
+
 	assert := require.New(ts.T())
 
 	ts.CreateGateway(storage.Gateway{
@@ -51,6 +54,7 @@ func (ts *ClassATestSuite) SetupSuite() {
 	})
 
 	ts.CreateServiceProfile(storage.ServiceProfile{
+		DRMax:         5,
 		AddGWMetadata: true,
 	})
 
@@ -61,11 +65,12 @@ func (ts *ClassATestSuite) SetupSuite() {
 	ts.RXInfo = gw.UplinkRXInfo{
 		GatewayId: ts.Gateway.GatewayID[:],
 		LoraSnr:   7,
-		Location: &commonPB.Location{
+		Location: &common.Location{
 			Latitude:  1,
 			Longitude: 2,
 			Altitude:  3,
 		},
+		Context: []byte{1, 2, 3, 4},
 	}
 	ts.RXInfo.Time = ptypes.TimestampNow()
 	ts.RXInfo.TimeSinceGpsEpoch = ptypes.DurationProto(10 * time.Second)
@@ -73,7 +78,7 @@ func (ts *ClassATestSuite) SetupSuite() {
 	ts.TXInfo = gw.UplinkTXInfo{
 		Frequency: 868100000,
 	}
-	assert.NoError(helpers.SetUplinkTXInfoDataRate(&ts.TXInfo, 0, config.C.NetworkServer.Band.Band))
+	assert.NoError(helpers.SetUplinkTXInfoDataRate(&ts.TXInfo, 0, band.Band()))
 }
 
 func (ts *ClassATestSuite) TestLW10Errors() {
@@ -173,7 +178,7 @@ func (ts *ClassATestSuite) TestLW11Errors() {
 		{
 			Name: "the data-rate is invalid (MIC)",
 			BeforeFunc: func(tst *ClassATest) error {
-				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 1, config.C.NetworkServer.Band.Band)
+				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 1, band.Band())
 			},
 			DeviceSession: *ts.DeviceSession,
 			TXInfo:        ts.TXInfo,
@@ -390,7 +395,7 @@ func (ts *ClassATestSuite) TestLW10Uplink() {
 					Data:    []byte{1, 2, 3, 4},
 					DeviceActivationContext: &as.DeviceActivationContext{
 						DevAddr: ts.DeviceSession.DevAddr[:],
-						AppSKey: &commonPB.KeyEnvelope{
+						AppSKey: &common.KeyEnvelope{
 							KekLabel: "lora-app-server",
 							AesKey:   []byte{1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8},
 						},
@@ -515,13 +520,20 @@ func (ts *ClassATestSuite) TestLW10Uplink() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -579,13 +591,20 @@ func (ts *ClassATestSuite) TestLW10Uplink() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -729,6 +748,8 @@ func (ts *ClassATestSuite) TestLW11Uplink() {
 }
 
 func (ts *ClassATestSuite) TestLW10RXDelay() {
+	assert := require.New(ts.T())
+
 	ts.CreateDeviceSession(storage.DeviceSession{
 		MACVersion:            "1.0.2",
 		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
@@ -743,7 +764,10 @@ func (ts *ClassATestSuite) TestLW10RXDelay() {
 		RXDelay:               3,
 	})
 
-	config.C.NetworkServer.NetworkSettings.RX1Delay = 3
+	conf := test.GetConfig()
+	conf.NetworkServer.NetworkSettings.RX1Delay = 3
+	assert.NoError(uplink.Setup(conf))
+	assert.NoError(downlink.Setup(conf))
 
 	var fPortOne uint8 = 1
 
@@ -784,13 +808,20 @@ func (ts *ClassATestSuite) TestLW10RXDelay() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 3000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second * 3),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -930,11 +961,11 @@ func (ts *ClassATestSuite) TestLW10MACCommands() {
 				}
 
 				ts.ServiceProfile.DevStatusReqFreq = 1
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			AfterFunc: func(tst *ClassATest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 0
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			DeviceSession: *ts.DeviceSession,
 			TXInfo:        ts.TXInfo,
@@ -959,13 +990,20 @@ func (ts *ClassATestSuite) TestLW10MACCommands() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -997,11 +1035,11 @@ func (ts *ClassATestSuite) TestLW10MACCommands() {
 				}
 
 				ts.ServiceProfile.DevStatusReqFreq = 1
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			AfterFunc: func(tst *ClassATest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 0
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			DeviceSession: *ts.DeviceSession,
 			DeviceQueueItems: []storage.DeviceQueueItem{
@@ -1029,13 +1067,20 @@ func (ts *ClassATestSuite) TestLW10MACCommands() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1061,6 +1106,232 @@ func (ts *ClassATestSuite) TestLW10MACCommands() {
 					},
 					MIC: lorawan.MIC{0xc4, 0x28, 0xa9, 0x32},
 				}),
+			},
+		},
+	}
+
+	for _, tst := range tests {
+		ts.T().Run(tst.Name, func(t *testing.T) {
+			ts.AssertClassATest(t, tst)
+		})
+	}
+}
+
+func (ts *ClassATestSuite) TestLW10MACCommandsDisabled() {
+	assert := require.New(ts.T())
+
+	ts.CreateDeviceSession(storage.DeviceSession{
+		MACVersion:            "1.0.2",
+		JoinEUI:               lorawan.EUI64{8, 7, 6, 5, 4, 3, 2, 1},
+		DevAddr:               lorawan.DevAddr{1, 2, 3, 4},
+		FNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		SNwkSIntKey:           [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		NwkSEncKey:            [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
+		FCntUp:                8,
+		NFCntDown:             5,
+		EnabledUplinkChannels: []int{0, 1, 2},
+		RX2Frequency:          869525000,
+	})
+
+	fPortZero := uint8(0)
+
+	conf := test.GetConfig()
+	conf.NetworkServer.NetworkSettings.DisableMACCommands = true
+	assert.NoError(uplink.Setup(conf))
+	assert.NoError(downlink.Setup(conf))
+
+	tests := []ClassATest{
+		{
+			Name:          "uplink with link-check request (FOpts)",
+			DeviceSession: *ts.DeviceSession,
+			TXInfo:        ts.TXInfo,
+			RXInfo:        ts.RXInfo,
+			PHYPayload: lorawan.PHYPayload{
+				MHDR: lorawan.MHDR{
+					MType: lorawan.UnconfirmedDataUp,
+					Major: lorawan.LoRaWANR1,
+				},
+				MACPayload: &lorawan.MACPayload{
+					FHDR: lorawan.FHDR{
+						DevAddr: ts.DeviceSession.DevAddr,
+						FCnt:    10,
+						FOpts: []lorawan.Payload{
+							&lorawan.MACCommand{CID: lorawan.LinkCheckReq},
+						},
+					},
+				},
+				MIC: lorawan.MIC{0x6a, 0x0e, 0x7c, 0xd4},
+			},
+			Assert: []Assertion{
+				AssertNCHandleUplinkMACCommandRequest(nc.HandleUplinkMACCommandRequest{
+					DevEui:   ts.Device.DevEUI[:],
+					Cid:      uint32(lorawan.LinkCheckReq),
+					Commands: [][]byte{{byte(lorawan.LinkCheckReq)}},
+				}),
+				AssertFCntUp(11),
+				AssertNFCntDown(5),
+			},
+		},
+		{
+			Name: "uplink with link-check request (FRMPayload)",
+			BeforeFunc: func(ts *ClassATest) error {
+				if err := ts.PHYPayload.EncryptFRMPayload(ts.DeviceSession.NwkSEncKey); err != nil {
+					return err
+				}
+				if err := ts.PHYPayload.SetUplinkDataMIC(lorawan.LoRaWAN1_0, 0, 0, 0, ts.DeviceSession.FNwkSIntKey, ts.DeviceSession.SNwkSIntKey); err != nil {
+					return err
+				}
+				return nil
+			},
+			DeviceSession: *ts.DeviceSession,
+			TXInfo:        ts.TXInfo,
+			RXInfo:        ts.RXInfo,
+			PHYPayload: lorawan.PHYPayload{
+				MHDR: lorawan.MHDR{
+					MType: lorawan.UnconfirmedDataUp,
+					Major: lorawan.LoRaWANR1,
+				},
+				MACPayload: &lorawan.MACPayload{
+					FHDR: lorawan.FHDR{
+						DevAddr: ts.DeviceSession.DevAddr,
+						FCnt:    10,
+					},
+					FPort: &fPortZero,
+					FRMPayload: []lorawan.Payload{
+						&lorawan.MACCommand{CID: lorawan.LinkCheckReq},
+					},
+				},
+			},
+			Assert: []Assertion{
+				AssertNCHandleUplinkMACCommandRequest(nc.HandleUplinkMACCommandRequest{
+					DevEui:   ts.Device.DevEUI[:],
+					Cid:      uint32(lorawan.LinkCheckReq),
+					Commands: [][]byte{{byte(lorawan.LinkCheckReq)}},
+				}),
+				AssertFCntUp(11),
+				AssertNFCntDown(5),
+			},
+		},
+		{
+			Name:          "uplink with downlink mac-command response (external)",
+			DeviceSession: *ts.DeviceSession,
+			TXInfo:        ts.TXInfo,
+			RXInfo:        ts.RXInfo,
+			MACCommandQueueItems: []storage.MACCommandBlock{
+				{
+					CID:      lorawan.LinkCheckAns,
+					External: true,
+					MACCommands: []lorawan.MACCommand{
+						{
+							CID: lorawan.LinkCheckAns,
+							Payload: &lorawan.LinkCheckAnsPayload{
+								Margin: 10,
+								GwCnt:  2,
+							},
+						},
+					},
+				},
+			},
+			PHYPayload: lorawan.PHYPayload{
+				MHDR: lorawan.MHDR{
+					MType: lorawan.UnconfirmedDataUp,
+					Major: lorawan.LoRaWANR1,
+				},
+				MACPayload: &lorawan.MACPayload{
+					FHDR: lorawan.FHDR{
+						DevAddr: ts.DeviceSession.DevAddr,
+						FCnt:    10,
+					},
+				},
+				MIC: lorawan.MIC{0x7a, 0x98, 0x98, 0xdc},
+			},
+			Assert: []Assertion{
+				AssertDownlinkFrame(gw.DownlinkTXInfo{
+					GatewayId:  ts.RXInfo.GatewayId,
+					Frequency:  ts.TXInfo.Frequency,
+					Power:      14,
+					Timestamp:  ts.RXInfo.Timestamp + 1000000,
+					Modulation: common.Modulation_LORA,
+					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
+						LoraModulationInfo: &gw.LoRaModulationInfo{
+							Bandwidth:             125,
+							SpreadingFactor:       12,
+							PolarizationInversion: true,
+							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
+						},
+					},
+				}, lorawan.PHYPayload{
+					MHDR: lorawan.MHDR{
+						MType: lorawan.UnconfirmedDataDown,
+						Major: lorawan.LoRaWANR1,
+					},
+					MACPayload: &lorawan.MACPayload{
+						FHDR: lorawan.FHDR{
+							DevAddr: ts.DeviceSession.DevAddr,
+							FCnt:    5,
+							FCtrl: lorawan.FCtrl{
+								ADR: true,
+							},
+							FOpts: []lorawan.Payload{
+								&lorawan.MACCommand{
+									CID: lorawan.LinkCheckAns,
+									Payload: &lorawan.LinkCheckAnsPayload{
+										Margin: 10,
+										GwCnt:  2,
+									},
+								},
+							},
+						},
+					},
+					MIC: lorawan.MIC{0xde, 0xb, 0x5d, 0x4e},
+				}),
+				AssertFCntUp(11),
+				AssertNFCntDown(6),
+			},
+		},
+		{
+			Name:          "uplink with discarded downlink mac-command response (internal)",
+			DeviceSession: *ts.DeviceSession,
+			TXInfo:        ts.TXInfo,
+			RXInfo:        ts.RXInfo,
+			MACCommandQueueItems: []storage.MACCommandBlock{
+				{
+					CID:      lorawan.LinkCheckAns,
+					External: false,
+					MACCommands: []lorawan.MACCommand{
+						{
+							CID: lorawan.LinkCheckAns,
+							Payload: &lorawan.LinkCheckAnsPayload{
+								Margin: 10,
+								GwCnt:  2,
+							},
+						},
+					},
+				},
+			},
+			PHYPayload: lorawan.PHYPayload{
+				MHDR: lorawan.MHDR{
+					MType: lorawan.UnconfirmedDataUp,
+					Major: lorawan.LoRaWANR1,
+				},
+				MACPayload: &lorawan.MACPayload{
+					FHDR: lorawan.FHDR{
+						DevAddr: ts.DeviceSession.DevAddr,
+						FCnt:    10,
+					},
+				},
+				MIC: lorawan.MIC{0x7a, 0x98, 0x98, 0xdc},
+			},
+			Assert: []Assertion{
+				AssertFCntUp(11),
+				AssertNFCntDown(5),
 			},
 		},
 	}
@@ -1159,7 +1430,7 @@ func (ts *ClassATestSuite) TestLW10AddGWMetadata() {
 	})
 
 	ts.ServiceProfile.AddGWMetadata = false
-	assert.NoError(storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile))
+	assert.NoError(storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile))
 
 	fPortOne := uint8(1)
 
@@ -1208,7 +1479,7 @@ func (ts *ClassATestSuite) TestLW10AddGWMetadata() {
 	}
 
 	ts.ServiceProfile.AddGWMetadata = true
-	assert.NoError(storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile))
+	assert.NoError(storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile))
 }
 
 func (ts *ClassATestSuite) TestLW11DeviceQueue() {
@@ -1269,13 +1540,20 @@ func (ts *ClassATestSuite) TestLW11DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1339,13 +1617,20 @@ func (ts *ClassATestSuite) TestLW11DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1436,13 +1721,20 @@ func (ts *ClassATestSuite) TestLW10DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1507,13 +1799,20 @@ func (ts *ClassATestSuite) TestLW10DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1578,13 +1877,20 @@ func (ts *ClassATestSuite) TestLW10DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1655,11 +1961,11 @@ func (ts *ClassATestSuite) TestLW10DeviceQueue() {
 			Name: "unconfirmed uplink data + one unconfirmed downlink payload in queue (exactly max size for dr 0) + one mac command",
 			BeforeFunc: func(tst *ClassATest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 1
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			AfterFunc: func(tst *ClassATest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 0
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			DeviceSession: *ts.DeviceSession,
 			TXInfo:        ts.TXInfo,
@@ -1698,13 +2004,20 @@ func (ts *ClassATestSuite) TestLW10DeviceQueue() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1783,13 +2096,20 @@ func (ts *ClassATestSuite) TestLW10ADR() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -1976,13 +2296,20 @@ func (ts *ClassATestSuite) TestLW10ADR() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2033,13 +2360,20 @@ func (ts *ClassATestSuite) TestLW10ADR() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2178,13 +2512,20 @@ func (ts *ClassATestSuite) TestLW10ADR() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2248,13 +2589,20 @@ func (ts *ClassATestSuite) TestLW10ADR() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2317,7 +2665,7 @@ func (ts *ClassATestSuite) TestLW10DeviceStatusRequest() {
 	ts.ServiceProfile.DevStatusReqFreq = 24
 	ts.ServiceProfile.ReportDevStatusBattery = true
 	ts.ServiceProfile.ReportDevStatusMargin = true
-	assert.NoError(storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile))
+	assert.NoError(storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile))
 
 	fPortOne := uint8(1)
 
@@ -2352,13 +2700,20 @@ func (ts *ClassATestSuite) TestLW10DeviceStatusRequest() {
 					Frequency:  ts.TXInfo.Frequency,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2478,7 +2833,7 @@ func (ts *ClassATestSuite) TestLW10DeviceStatusRequest() {
 	ts.ServiceProfile.DevStatusReqFreq = 0
 	ts.ServiceProfile.ReportDevStatusBattery = false
 	ts.ServiceProfile.ReportDevStatusMargin = false
-	assert.NoError(storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile))
+	assert.NoError(storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile))
 }
 
 func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
@@ -2502,8 +2857,10 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 		{
 			Name: "unconfirmed uplink with payload (rx1)",
 			BeforeFunc: func(tst *ClassATest) error {
-				config.C.NetworkServer.NetworkSettings.RXWindow = 1
-				return nil
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.RXWindow = 1
+
+				return downlink.Setup(conf)
 			},
 			DeviceQueueItems: []storage.DeviceQueueItem{
 				{DevEUI: ts.Device.DevEUI, FRMPayload: []byte{1}, FPort: 1, FCnt: 4},
@@ -2534,13 +2891,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2566,8 +2930,10 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 		{
 			Name: "unconfirmed uplink with payload (rx2)",
 			BeforeFunc: func(tst *ClassATest) error {
-				config.C.NetworkServer.NetworkSettings.RXWindow = 2
-				return nil
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.RXWindow = 2
+
+				return downlink.Setup(conf)
 			},
 			DeviceQueueItems: []storage.DeviceQueueItem{
 				{DevEUI: ts.Device.DevEUI, FRMPayload: []byte{1}, FPort: 1, FCnt: 4},
@@ -2598,13 +2964,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  869525000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 2000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second * 2),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2630,8 +3003,10 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 		{
 			Name: "unconfirmed uplink with payload (rx1 + rx2)",
 			BeforeFunc: func(tst *ClassATest) error {
-				config.C.NetworkServer.NetworkSettings.RXWindow = 0
-				return nil
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.RXWindow = 0
+
+				return downlink.Setup(conf)
 			},
 			DeviceQueueItems: []storage.DeviceQueueItem{
 				{DevEUI: ts.Device.DevEUI, FRMPayload: []byte{1}, FPort: 1, FCnt: 4},
@@ -2662,13 +3037,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2694,13 +3076,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  869525000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 2000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second * 2),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2726,8 +3115,10 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 		{
 			Name: "unconfirmed uplink with payload (rx1, payload exceeds rx2 limit)",
 			BeforeFunc: func(tst *ClassATest) error {
-				config.C.NetworkServer.NetworkSettings.RXWindow = 0
-				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 5, config.C.NetworkServer.Band.Band)
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.RXWindow = 0
+				downlink.Setup(conf)
+				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 5, band.Band())
 			},
 			DeviceQueueItems: []storage.DeviceQueueItem{
 				{DevEUI: ts.Device.DevEUI, FRMPayload: make([]byte, 100), FPort: 1, FCnt: 4},
@@ -2758,13 +3149,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       7,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2791,18 +3189,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 		{
 			Name: "unconfirmed uplink with payload (rx1, mac-command stripped as it exceeds rx2 limit)",
 			BeforeFunc: func(tst *ClassATest) error {
-				config.C.NetworkServer.NetworkSettings.RXWindow = 0
+				conf := test.GetConfig()
+				conf.NetworkServer.NetworkSettings.RXWindow = 0
+				downlink.Setup(conf)
 
 				ts.ServiceProfile.DevStatusReqFreq = 1
-				if err := storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile); err != nil {
+				if err := storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile); err != nil {
 					return err
 				}
 
-				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 5, config.C.NetworkServer.Band.Band)
+				return helpers.SetUplinkTXInfoDataRate(&tst.TXInfo, 5, band.Band())
 			},
 			AfterFunc: func(tst *ClassATest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 0
-				return storage.UpdateServiceProfile(ts.DB(), ts.ServiceProfile)
+				return storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile)
 			},
 			DeviceQueueItems: []storage.DeviceQueueItem{
 				{DevEUI: ts.Device.DevEUI, FRMPayload: make([]byte, 51), FPort: 1, FCnt: 4},
@@ -2833,13 +3233,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  868100000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 1000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       7,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2870,13 +3277,20 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 					Frequency:  869525000,
 					Power:      14,
 					Timestamp:  ts.RXInfo.Timestamp + 2000000,
-					Modulation: commonPB.Modulation_LORA,
+					Modulation: common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
 							SpreadingFactor:       12,
 							PolarizationInversion: true,
 							CodeRate:              "4/5",
+						},
+					},
+					Context: ts.RXInfo.Context,
+					Timing:  gw.DownlinkTiming_DELAY,
+					TimingInfo: &gw.DownlinkTXInfo_DelayTimingInfo{
+						DelayTimingInfo: &gw.DelayTimingInfo{
+							Delay: ptypes.DurationProto(time.Second * 2),
 						},
 					},
 				}, lorawan.PHYPayload{
@@ -2906,15 +3320,6 @@ func (ts *ClassATestSuite) TestLW11ReceiveWindowSelection() {
 			ts.AssertClassATest(t, tst)
 		})
 	}
-}
-
-func (ts *ClassATestSuite) resetBand() {
-	config.C.NetworkServer.NetworkSettings.InstallationMargin = 5
-	config.C.NetworkServer.Band.Band, _ = band.GetConfig(band.EU_863_870, false, lorawan.DwellTimeNoLimit)
-	config.C.NetworkServer.NetworkSettings.RX2DR = 0
-	config.C.NetworkServer.NetworkSettings.RX1DROffset = 0
-	config.C.NetworkServer.NetworkSettings.RX1Delay = 0
-	config.C.NetworkServer.NetworkSettings.RXWindow = 0
 }
 
 func TestClassA(t *testing.T) {

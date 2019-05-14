@@ -3,18 +3,29 @@ package testsuite
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
 	"github.com/brocaar/loraserver/api/as"
-	commonPB "github.com/brocaar/loraserver/api/common"
+	"github.com/brocaar/loraserver/api/common"
 	"github.com/brocaar/loraserver/api/gw"
 	"github.com/brocaar/loraserver/api/ns"
+	"github.com/brocaar/loraserver/internal/downlink"
 	"github.com/brocaar/loraserver/internal/storage"
+	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/lorawan"
 )
 
 type ProprietaryTestCase struct {
 	IntegrationTestSuite
+}
+
+func (ts *ProprietaryTestCase) SetupTest() {
+	ts.IntegrationTestSuite.SetupTest()
+	assert := require.New(ts.T())
+
+	conf := test.GetConfig()
+	assert.NoError(downlink.Setup(conf))
 }
 
 func (ts *ProprietaryTestCase) TestDownlink() {
@@ -36,7 +47,7 @@ func (ts *ProprietaryTestCase) TestDownlink() {
 					Immediately: true,
 					Frequency:   868100000,
 					Power:       14,
-					Modulation:  commonPB.Modulation_LORA,
+					Modulation:  common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
@@ -44,6 +55,10 @@ func (ts *ProprietaryTestCase) TestDownlink() {
 							CodeRate:              "4/5",
 							PolarizationInversion: true,
 						},
+					},
+					Timing: gw.DownlinkTiming_IMMEDIATELY,
+					TimingInfo: &gw.DownlinkTXInfo_ImmediatelyTimingInfo{
+						ImmediatelyTimingInfo: &gw.ImmediatelyTimingInfo{},
 					},
 				}, lorawan.PHYPayload{
 					MHDR: lorawan.MHDR{
@@ -72,7 +87,7 @@ func (ts *ProprietaryTestCase) TestDownlink() {
 					Immediately: true,
 					Frequency:   868100000,
 					Power:       14,
-					Modulation:  commonPB.Modulation_LORA,
+					Modulation:  common.Modulation_LORA,
 					ModulationInfo: &gw.DownlinkTXInfo_LoraModulationInfo{
 						LoraModulationInfo: &gw.LoRaModulationInfo{
 							Bandwidth:             125,
@@ -80,6 +95,10 @@ func (ts *ProprietaryTestCase) TestDownlink() {
 							CodeRate:              "4/5",
 							PolarizationInversion: false,
 						},
+					},
+					Timing: gw.DownlinkTiming_IMMEDIATELY,
+					TimingInfo: &gw.DownlinkTXInfo_ImmediatelyTimingInfo{
+						ImmediatelyTimingInfo: &gw.ImmediatelyTimingInfo{},
 					},
 				}, lorawan.PHYPayload{
 					MHDR: lorawan.MHDR{
@@ -127,7 +146,7 @@ func (ts *ProprietaryTestCase) TestUplink() {
 			},
 			TXInfo: gw.UplinkTXInfo{
 				Frequency:  868100000,
-				Modulation: commonPB.Modulation_LORA,
+				Modulation: common.Modulation_LORA,
 				ModulationInfo: &gw.UplinkTXInfo_LoraModulationInfo{
 					LoraModulationInfo: &gw.LoRaModulationInfo{
 						Bandwidth:       125,
@@ -148,7 +167,7 @@ func (ts *ProprietaryTestCase) TestUplink() {
 					Mic:        []byte{5, 6, 7, 8},
 					TxInfo: &gw.UplinkTXInfo{
 						Frequency:  868100000,
-						Modulation: commonPB.Modulation_LORA,
+						Modulation: common.Modulation_LORA,
 						ModulationInfo: &gw.UplinkTXInfo_LoraModulationInfo{
 							LoraModulationInfo: &gw.LoRaModulationInfo{
 								Bandwidth:       125,
@@ -163,7 +182,7 @@ func (ts *ProprietaryTestCase) TestUplink() {
 							Rssi:      -10,
 							LoraSnr:   5,
 							Timestamp: 12345,
-							Location: &commonPB.Location{
+							Location: &common.Location{
 								Latitude:  1.1234,
 								Longitude: 2.345,
 								Altitude:  10,

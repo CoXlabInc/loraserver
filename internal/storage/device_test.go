@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/brocaar/lorawan"
 	"github.com/stretchr/testify/require"
+
+	"github.com/brocaar/lorawan"
 )
 
 func (ts *StorageTestSuite) TestDevice() {
@@ -29,6 +30,7 @@ func (ts *StorageTestSuite) TestDevice() {
 			RoutingProfileID:  rp.ID,
 			SkipFCntCheck:     true,
 			ReferenceAltitude: 5.6,
+			Mode:              DeviceModeB,
 		}
 
 		assert.Nil(CreateDevice(ts.Tx(), &d))
@@ -62,6 +64,7 @@ func (ts *StorageTestSuite) TestDevice() {
 			d.RoutingProfileID = rpNew.ID
 			d.SkipFCntCheck = false
 			d.ReferenceAltitude = 6.7
+			d.Mode = DeviceModeC
 
 			assert.Nil(UpdateDevice(ts.Tx(), &d))
 			d.UpdatedAt = d.UpdatedAt.Round(time.Second).UTC()

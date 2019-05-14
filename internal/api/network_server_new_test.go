@@ -12,24 +12,31 @@ import (
 	"google.golang.org/grpc/codes"
 
 	"github.com/brocaar/loraserver/api/ns"
+	"github.com/brocaar/loraserver/internal/band"
 	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/downlink/data/classb"
 	"github.com/brocaar/loraserver/internal/gps"
 	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/lorawan"
+	loraband "github.com/brocaar/lorawan/band"
 )
 
 type NetworkServerAPITestSuite struct {
 	suite.Suite
-	test.DatabaseTestSuiteBase
-
 	api ns.NetworkServerServiceServer
 }
 
 func (ts *NetworkServerAPITestSuite) SetupSuite() {
-	ts.DatabaseTestSuiteBase.SetupSuite()
+	assert := require.New(ts.T())
+	conf := test.GetConfig()
+	assert.NoError(storage.Setup(conf))
+	test.MustResetDB(storage.DB().DB)
 	ts.api = NewNetworkServerAPI()
+}
+
+func (ts *NetworkServerAPITestSuite) SetupTest() {
+	test.MustFlushRedis(storage.RedisPool())
 }
 
 func (ts *NetworkServerAPITestSuite) TestMulticastGroup() {
@@ -38,8 +45,8 @@ func (ts *NetworkServerAPITestSuite) TestMulticastGroup() {
 	var rp storage.RoutingProfile
 	var sp storage.ServiceProfile
 
-	assert.NoError(storage.CreateRoutingProfile(ts.DB(), &rp))
-	assert.NoError(storage.CreateServiceProfile(ts.DB(), &sp))
+	assert.NoError(storage.CreateRoutingProfile(storage.DB(), &rp))
+	assert.NoError(storage.CreateServiceProfile(storage.DB(), &sp))
 
 	mg := ns.MulticastGroup{
 		McAddr:           []byte{1, 2, 3, 4},
@@ -138,16 +145,16 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 		},
 	}
 	for i := range gateways {
-		assert.NoError(storage.CreateGateway(ts.DB(), &gateways[i]))
+		assert.NoError(storage.CreateGateway(storage.DB(), &gateways[i]))
 	}
 
 	var rp storage.RoutingProfile
 	var sp storage.ServiceProfile
 	var dp storage.DeviceProfile
 
-	assert.NoError(storage.CreateRoutingProfile(ts.DB(), &rp))
-	assert.NoError(storage.CreateServiceProfile(ts.DB(), &sp))
-	assert.NoError(storage.CreateDeviceProfile(ts.DB(), &dp))
+	assert.NoError(storage.CreateRoutingProfile(storage.DB(), &rp))
+	assert.NoError(storage.CreateServiceProfile(storage.DB(), &sp))
+	assert.NoError(storage.CreateDeviceProfile(storage.DB(), &dp))
 
 	devices := []storage.Device{
 		{
@@ -164,8 +171,8 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 		},
 	}
 	for i := range devices {
-		assert.NoError(storage.CreateDevice(ts.DB(), &devices[i]))
-		assert.NoError(storage.SaveDeviceGatewayRXInfoSet(ts.RedisPool(), storage.DeviceGatewayRXInfoSet{
+		assert.NoError(storage.CreateDevice(storage.DB(), &devices[i]))
+		assert.NoError(storage.SaveDeviceGatewayRXInfoSet(storage.RedisPool(), storage.DeviceGatewayRXInfoSet{
 			DevEUI: devices[i].DevEUI,
 			DR:     3,
 			Items: []storage.DeviceGatewayRXInfo{
@@ -188,10 +195,10 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 			ServiceProfileID: sp.ID,
 			RoutingProfileID: rp.ID,
 		}
-		assert.NoError(storage.CreateMulticastGroup(ts.DB(), &mg))
+		assert.NoError(storage.CreateMulticastGroup(storage.DB(), &mg))
 
 		for _, d := range devices {
-			assert.NoError(storage.AddDeviceToMulticastGroup(ts.DB(), d.DevEUI, mg.ID))
+			assert.NoError(storage.AddDeviceToMulticastGroup(storage.DB(), d.DevEUI, mg.ID))
 		}
 
 		ts.T().Run("Create", func(t *testing.T) {
@@ -240,7 +247,7 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 			t.Run("Test emit and schedule at", func(t *testing.T) {
 				assert := require.New(t)
 
-				items, err := storage.GetMulticastQueueItemsForMulticastGroup(ts.DB(), mg.ID)
+				items, err := storage.GetMulticastQueueItemsForMulticastGroup(storage.DB(), mg.ID)
 				assert.NoError(err)
 				assert.Len(items, 4)
 
@@ -277,10 +284,10 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 			ServiceProfileID: sp.ID,
 			RoutingProfileID: rp.ID,
 		}
-		assert.NoError(storage.CreateMulticastGroup(ts.DB(), &mg))
+		assert.NoError(storage.CreateMulticastGroup(storage.DB(), &mg))
 
 		for _, d := range devices {
-			assert.NoError(storage.AddDeviceToMulticastGroup(ts.DB(), d.DevEUI, mg.ID))
+			assert.NoError(storage.AddDeviceToMulticastGroup(storage.DB(), d.DevEUI, mg.ID))
 		}
 
 		ts.T().Run("Create", func(t *testing.T) {
@@ -329,7 +336,7 @@ func (ts *NetworkServerAPITestSuite) TestMulticastQueue() {
 			t.Run("Test emit and schedule at", func(t *testing.T) {
 				assert := require.New(t)
 
-				items, err := storage.GetMulticastQueueItemsForMulticastGroup(ts.DB(), mg.ID)
+				items, err := storage.GetMulticastQueueItemsForMulticastGroup(storage.DB(), mg.ID)
 				assert.NoError(err)
 				assert.Len(items, 4)
 
@@ -357,13 +364,30 @@ func (ts *NetworkServerAPITestSuite) TestDevice() {
 	assert := require.New(ts.T())
 
 	rp := storage.RoutingProfile{}
-	assert.NoError(storage.CreateRoutingProfile(ts.DB(), &rp))
+	assert.NoError(storage.CreateRoutingProfile(storage.DB(), &rp))
 
-	sp := storage.ServiceProfile{}
-	assert.NoError(storage.CreateServiceProfile(ts.DB(), &sp))
+	sp := storage.ServiceProfile{
+		DRMin: 3,
+		DRMax: 6,
+	}
+	assert.NoError(storage.CreateServiceProfile(storage.DB(), &sp))
 
-	dp := storage.DeviceProfile{}
-	assert.NoError(storage.CreateDeviceProfile(ts.DB(), &dp))
+	dp := storage.DeviceProfile{
+		FactoryPresetFreqs: []int{
+			868100000,
+			868300000,
+			868500000,
+		},
+		RXDelay1:       3,
+		RXDROffset1:    2,
+		RXDataRate2:    5,
+		RXFreq2:        868900000,
+		PingSlotPeriod: 32,
+		PingSlotFreq:   868100000,
+		PingSlotDR:     5,
+		MACVersion:     "1.0.2",
+	}
+	assert.NoError(storage.CreateDeviceProfile(storage.DB(), &dp))
 
 	devEUI := lorawan.EUI64{1, 2, 3, 4, 5, 6, 7, 8}
 
@@ -394,25 +418,6 @@ func (ts *NetworkServerAPITestSuite) TestDevice() {
 			assert.Equal(d, getResp.Device)
 		})
 
-		t.Run("Update", func(t *testing.T) {
-			assert := require.New(t)
-
-			rp2 := storage.RoutingProfile{}
-			assert.NoError(storage.CreateRoutingProfile(ts.DB(), &rp2))
-
-			d.RoutingProfileId = rp2.ID.Bytes()
-			_, err := ts.api.UpdateDevice(context.Background(), &ns.UpdateDeviceRequest{
-				Device: d,
-			})
-			assert.NoError(err)
-
-			getResp, err := ts.api.GetDevice(context.Background(), &ns.GetDeviceRequest{
-				DevEui: devEUI[:],
-			})
-			assert.NoError(err)
-			assert.Equal(d, getResp.Device)
-		})
-
 		t.Run("Multicast-groups", func(t *testing.T) {
 			assert := require.New(t)
 
@@ -420,7 +425,7 @@ func (ts *NetworkServerAPITestSuite) TestDevice() {
 				RoutingProfileID: rp.ID,
 				ServiceProfileID: sp.ID,
 			}
-			assert.NoError(storage.CreateMulticastGroup(ts.DB(), &mg1))
+			assert.NoError(storage.CreateMulticastGroup(storage.DB(), &mg1))
 
 			t.Run("Add", func(t *testing.T) {
 				_, err := ts.api.AddDeviceToMulticastGroup(context.Background(), &ns.AddDeviceToMulticastGroupRequest{
@@ -446,6 +451,312 @@ func (ts *NetworkServerAPITestSuite) TestDevice() {
 					assert.Equal(codes.NotFound, grpc.Code(err))
 				})
 			})
+		})
+
+		t.Run("Activate", func(t *testing.T) {
+			assert := require.New(t)
+
+			devEUI := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+			devAddr := [4]byte{6, 2, 3, 4}
+			sNwkSIntKey := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			fNwkSIntKey := [16]byte{2, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+			nwkSEncKey := [16]byte{3, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+
+			_, err = ts.api.ActivateDevice(context.Background(), &ns.ActivateDeviceRequest{
+				DeviceActivation: &ns.DeviceActivation{
+					DevEui:        devEUI[:],
+					DevAddr:       devAddr[:],
+					SNwkSIntKey:   sNwkSIntKey[:],
+					FNwkSIntKey:   fNwkSIntKey[:],
+					NwkSEncKey:    nwkSEncKey[:],
+					FCntUp:        10,
+					NFCntDown:     11,
+					AFCntDown:     12,
+					SkipFCntCheck: false,
+				},
+			})
+			assert.NoError(err)
+
+			t.Run("Enqueue with different security-context", func(t *testing.T) {
+				assert := require.New(t)
+
+				// create item in the queue (device is not activated yet)
+				_, err := ts.api.CreateDeviceQueueItem(context.Background(), &ns.CreateDeviceQueueItemRequest{
+					Item: &ns.DeviceQueueItem{
+						DevAddr:    []byte{1, 2, 3, 4},
+						DevEui:     devEUI[:],
+						FrmPayload: []byte{1, 2, 3, 4},
+						FCnt:       10,
+						FPort:      20,
+					},
+				})
+				assert.NotNil(err)
+				assert.Equal(codes.InvalidArgument, grpc.Code(err))
+			})
+
+			t.Run("Enqueue with valid security-context", func(t *testing.T) {
+				assert := require.New(t)
+
+				// create item in the queue (device is not activated yet)
+				_, err := ts.api.CreateDeviceQueueItem(context.Background(), &ns.CreateDeviceQueueItemRequest{
+					Item: &ns.DeviceQueueItem{
+						DevAddr:    []byte{6, 2, 3, 4},
+						DevEui:     devEUI[:],
+						FrmPayload: []byte{1, 2, 3, 4},
+						FCnt:       10,
+						FPort:      20,
+					},
+				})
+				assert.Nil(err)
+			})
+
+			_, err = ts.api.ActivateDevice(context.Background(), &ns.ActivateDeviceRequest{
+				DeviceActivation: &ns.DeviceActivation{
+					DevEui:        devEUI[:],
+					DevAddr:       devAddr[:],
+					SNwkSIntKey:   sNwkSIntKey[:],
+					FNwkSIntKey:   fNwkSIntKey[:],
+					NwkSEncKey:    nwkSEncKey[:],
+					FCntUp:        10,
+					NFCntDown:     11,
+					AFCntDown:     12,
+					SkipFCntCheck: false,
+				},
+			})
+			assert.NoError(err)
+
+			t.Run("Device-queue is flushed", func(t *testing.T) {
+				assert := require.New(t)
+				items, err := storage.GetDeviceQueueItemsForDevEUI(storage.DB(), devEUI)
+				assert.NoError(err)
+				assert.Len(items, 0)
+			})
+
+			t.Run("Device-session is created", func(t *testing.T) {
+				ds, err := storage.GetDeviceSession(storage.RedisPool(), devEUI)
+				assert.NoError(err)
+				assert.Equal(storage.DeviceSession{
+					DeviceProfileID:  dp.ID,
+					ServiceProfileID: sp.ID,
+					RoutingProfileID: rp.ID,
+
+					DevAddr:               devAddr,
+					DevEUI:                devEUI,
+					SNwkSIntKey:           sNwkSIntKey,
+					FNwkSIntKey:           fNwkSIntKey,
+					NwkSEncKey:            nwkSEncKey,
+					FCntUp:                10,
+					NFCntDown:             11,
+					AFCntDown:             12,
+					SkipFCntValidation:    true,
+					EnabledUplinkChannels: band.Band().GetEnabledUplinkChannelIndices(),
+					ChannelFrequencies:    []int{868100000, 868300000, 868500000},
+					ExtraUplinkChannels:   map[int]loraband.Channel{},
+					RXDelay:               3,
+					RX1DROffset:           2,
+					RX2DR:                 5,
+					RX2Frequency:          868900000,
+					UplinkGatewayHistory:  make(map[lorawan.EUI64]storage.UplinkGatewayHistory),
+					PingSlotNb:            128,
+					PingSlotDR:            5,
+					PingSlotFrequency:     868100000,
+					NbTrans:               1,
+					MACVersion:            "1.0.2",
+				}, ds)
+			})
+
+			t.Run("GetDeviceActivation", func(t *testing.T) {
+				assert := require.New(t)
+
+				resp, err := ts.api.GetDeviceActivation(context.Background(), &ns.GetDeviceActivationRequest{DevEui: devEUI[:]})
+				assert.NoError(err)
+				assert.Equal(&ns.DeviceActivation{
+					DevEui:        devEUI[:],
+					DevAddr:       devAddr[:],
+					SNwkSIntKey:   sNwkSIntKey[:],
+					FNwkSIntKey:   fNwkSIntKey[:],
+					NwkSEncKey:    nwkSEncKey[:],
+					FCntUp:        10,
+					NFCntDown:     11,
+					AFCntDown:     12,
+					SkipFCntCheck: true,
+				}, resp.DeviceActivation)
+			})
+
+			t.Run("GetNextDownlinkFCntForDevEUI", func(t *testing.T) {
+				t.Run("LoRaWAN 1.0", func(t *testing.T) {
+					assert := require.New(t)
+					resp, err := ts.api.GetNextDownlinkFCntForDevEUI(context.Background(), &ns.GetNextDownlinkFCntForDevEUIRequest{DevEui: devEUI[:]})
+					assert.NoError(err)
+					assert.EqualValues(11, resp.FCnt)
+				})
+
+				t.Run("LoRaWAN 1.1", func(t *testing.T) {
+					assert := require.New(t)
+					ds, err := storage.GetDeviceSession(storage.RedisPool(), devEUI)
+					assert.NoError(err)
+					ds.MACVersion = "1.1.0"
+					assert.NoError(storage.SaveDeviceSession(storage.RedisPool(), ds))
+
+					resp, err := ts.api.GetNextDownlinkFCntForDevEUI(context.Background(), &ns.GetNextDownlinkFCntForDevEUIRequest{DevEui: devEUI[:]})
+					assert.NoError(err)
+					assert.EqualValues(12, resp.FCnt)
+				})
+
+				t.Run("With item in device-queue", func(t *testing.T) {
+					assert := require.New(t)
+					_, err := ts.api.CreateDeviceQueueItem(context.Background(), &ns.CreateDeviceQueueItemRequest{
+						Item: &ns.DeviceQueueItem{
+							DevEui:     devEUI[:],
+							FrmPayload: []byte{1, 2, 3, 4},
+							FCnt:       13,
+							FPort:      20,
+						},
+					})
+					assert.NoError(err)
+
+					resp, err := ts.api.GetNextDownlinkFCntForDevEUI(context.Background(), &ns.GetNextDownlinkFCntForDevEUIRequest{DevEui: devEUI[:]})
+					assert.NoError(err)
+					assert.EqualValues(14, resp.FCnt)
+				})
+			})
+
+			t.Run("DeactivateDevice", func(t *testing.T) {
+				assert := require.New(t)
+
+				items, err := storage.GetDeviceQueueItemsForDevEUI(storage.DB(), devEUI)
+				assert.NoError(err)
+				assert.Len(items, 1)
+
+				_, err = ts.api.DeactivateDevice(context.Background(), &ns.DeactivateDeviceRequest{
+					DevEui: devEUI[:],
+				})
+				assert.NoError(err)
+
+				_, err = ts.api.GetDeviceActivation(context.Background(), &ns.GetDeviceActivationRequest{DevEui: devEUI[:]})
+				assert.Equal(codes.NotFound, grpc.Code(err))
+
+				items, err = storage.GetDeviceQueueItemsForDevEUI(storage.DB(), devEUI)
+				assert.NoError(err)
+				assert.Len(items, 0)
+			})
+
+			t.Run("Activate with Device.SkipFCntCheck set to true", func(t *testing.T) {
+				d.SkipFCntCheck = true
+				_, err := ts.api.UpdateDevice(context.Background(), &ns.UpdateDeviceRequest{
+					Device: d,
+				})
+				assert.NoError(err)
+
+				_, err = ts.api.ActivateDevice(context.Background(), &ns.ActivateDeviceRequest{
+					DeviceActivation: &ns.DeviceActivation{
+						DevEui:        devEUI[:],
+						DevAddr:       devAddr[:],
+						SNwkSIntKey:   sNwkSIntKey[:],
+						FNwkSIntKey:   fNwkSIntKey[:],
+						NwkSEncKey:    nwkSEncKey[:],
+						FCntUp:        10,
+						NFCntDown:     11,
+						AFCntDown:     12,
+						SkipFCntCheck: false,
+					},
+				})
+				assert.NoError(err)
+
+				ds, err := storage.GetDeviceSession(storage.RedisPool(), devEUI)
+				assert.NoError(err)
+				assert.True(ds.SkipFCntValidation)
+			})
+
+			t.Run("Device mode", func(t *testing.T) {
+				tests := []struct {
+					Name            string
+					ClassBSupported bool
+					ClassCSupported bool
+					MACVersion      string
+					ExpectedMode    storage.DeviceMode
+				}{
+					{
+						Name:         "LoRaWAN 1.0 Class A supported",
+						MACVersion:   "1.0.3",
+						ExpectedMode: storage.DeviceModeA,
+					},
+					{
+						Name:            "LoRaWAN 1.0 Class B supported",
+						MACVersion:      "1.0.3",
+						ClassBSupported: true,
+						ExpectedMode:    storage.DeviceModeA,
+					},
+					{
+						Name:            "LoRaWAN 1.0 Class C supported",
+						MACVersion:      "1.0.3",
+						ClassCSupported: true,
+						ExpectedMode:    storage.DeviceModeC,
+					},
+					{
+						Name:         "LoRaWAN 1.1 Class A supported",
+						MACVersion:   "1.1.0",
+						ExpectedMode: storage.DeviceModeA,
+					},
+					{
+						Name:            "LoRaWAN 1.1 Class B supported",
+						MACVersion:      "1.1.0",
+						ClassBSupported: true,
+						ExpectedMode:    storage.DeviceModeA,
+					},
+					{
+						Name:            "LoRaWAN 1.1 Class C supported",
+						MACVersion:      "1.1.0",
+						ClassCSupported: true,
+						ExpectedMode:    storage.DeviceModeA,
+					},
+				}
+
+				for _, tst := range tests {
+					t.Run(tst.Name, func(t *testing.T) {
+						assert := require.New(t)
+						dp.SupportsClassB = tst.ClassBSupported
+						dp.SupportsClassC = tst.ClassCSupported
+						dp.MACVersion = tst.MACVersion
+
+						assert.NoError(storage.UpdateDeviceProfile(storage.DB(), &dp))
+
+						_, err = ts.api.ActivateDevice(context.Background(), &ns.ActivateDeviceRequest{
+							DeviceActivation: &ns.DeviceActivation{
+								DevEui:      devEUI[:],
+								DevAddr:     devAddr[:],
+								SNwkSIntKey: sNwkSIntKey[:],
+								FNwkSIntKey: fNwkSIntKey[:],
+								NwkSEncKey:  nwkSEncKey[:],
+							},
+						})
+						assert.NoError(err)
+
+						d, err := storage.GetDevice(storage.DB(), devEUI)
+						assert.NoError(err)
+						assert.Equal(tst.ExpectedMode, d.Mode)
+					})
+				}
+			})
+		})
+
+		t.Run("Update", func(t *testing.T) {
+			assert := require.New(t)
+
+			rp2 := storage.RoutingProfile{}
+			assert.NoError(storage.CreateRoutingProfile(storage.DB(), &rp2))
+
+			d.RoutingProfileId = rp2.ID.Bytes()
+			_, err := ts.api.UpdateDevice(context.Background(), &ns.UpdateDeviceRequest{
+				Device: d,
+			})
+			assert.NoError(err)
+
+			getResp, err := ts.api.GetDevice(context.Background(), &ns.GetDeviceRequest{
+				DevEui: devEUI[:],
+			})
+			assert.NoError(err)
+			assert.Equal(d, getResp.Device)
 		})
 
 		t.Run("Delete", func(t *testing.T) {

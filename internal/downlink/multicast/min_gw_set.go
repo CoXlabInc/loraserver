@@ -9,7 +9,7 @@ import (
 	"gonum.org/v1/gonum/graph/path"
 	"gonum.org/v1/gonum/graph/simple"
 
-	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/band"
 	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/lorawan"
 )
@@ -45,7 +45,10 @@ func GetMinimumGatewaySet(rxInfoSets []storage.DeviceGatewayRXInfoSet) ([]lorawa
 
 	outMap := make(map[lorawan.EUI64]struct{})
 
-	for _, e := range dst.Edges() {
+	edges := dst.Edges()
+	for edges.Next() {
+		e := edges.Edge()
+
 		fromEUI := int64ToEUI64(e.From().ID())
 		toEUI := int64ToEUI64(e.To().ID())
 
@@ -111,16 +114,16 @@ func gwInGWSet(gatewayID lorawan.EUI64, gwSet []lorawan.EUI64) bool {
 
 func addDeviceEdges(g *simple.WeightedUndirectedGraph, rxInfoSets []storage.DeviceGatewayRXInfoSet) {
 	for _, rxInfo := range rxInfoSets {
-		dr, err := config.C.NetworkServer.Band.Band.GetDataRate(rxInfo.DR)
+		dr, err := band.Band().GetDataRate(rxInfo.DR)
 		if err != nil {
 			log.WithError(err).WithFields(log.Fields{
 				"dr": dr,
 			}).Error("invalid data-data")
 		}
 
-		reqSNR, ok := config.SpreadFactorToRequiredSNRTable[dr.SpreadFactor]
+		reqSNR, ok := spreadFactorToRequiredSNRTable[dr.SpreadFactor]
 		if ok {
-			reqSNR += config.C.NetworkServer.NetworkSettings.InstallationMargin
+			reqSNR += installationMargin
 		}
 
 		var hasReqSNR bool
@@ -170,9 +173,23 @@ func (e deviceGatewayEdge) Weight() float64 {
 	weight := float64(1)
 
 	gwNodes := e.graph.From(eui64Int64(e.gatewayID))
-	if len(gwNodes) != 0 {
-		weight = weight / float64(len(gwNodes))
+
+	if gwNodes.Len() != 0 {
+		weight = weight / float64(gwNodes.Len())
 	}
 
 	return weight
+}
+
+// spreadFactorToRequiredSNRTable contains the required SNR to demodulate a
+// LoRa frame for the given spreadfactor.
+// These values are taken from the SX1276 datasheet.
+var spreadFactorToRequiredSNRTable = map[int]float64{
+	6:  -5,
+	7:  -7.5,
+	8:  -10,
+	9:  -12.5,
+	10: -15,
+	11: -17.5,
+	12: -20,
 }

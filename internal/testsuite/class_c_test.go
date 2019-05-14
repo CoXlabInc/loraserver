@@ -7,9 +7,11 @@ import (
 	"github.com/stretchr/testify/suite"
 
 	"github.com/brocaar/loraserver/api/gw"
-	"github.com/brocaar/loraserver/internal/config"
+	"github.com/brocaar/loraserver/internal/band"
+	"github.com/brocaar/loraserver/internal/downlink"
 	"github.com/brocaar/loraserver/internal/helpers"
 	"github.com/brocaar/loraserver/internal/storage"
+	"github.com/brocaar/loraserver/internal/test"
 	"github.com/brocaar/lorawan"
 )
 
@@ -18,10 +20,18 @@ type ClassCTestSuite struct {
 }
 
 func (ts *ClassCTestSuite) SetupTest() {
+	assert := require.New(ts.T())
 	ts.IntegrationTestSuite.SetupTest()
-	config.C.NetworkServer.NetworkSettings.RX2DR = 5
+
+	conf := test.GetConfig()
+	conf.NetworkServer.NetworkSettings.RX2DR = 5
+	assert.NoError(downlink.Setup(conf))
 
 	ts.CreateDeviceProfile(storage.DeviceProfile{SupportsClassC: true})
+
+	ts.CreateDevice(storage.Device{
+		Mode: storage.DeviceModeC,
+	})
 
 	// note that the CreateDeviceSession will automatically set
 	// the device, profiles etc.. :)
@@ -41,19 +51,24 @@ func (ts *ClassCTestSuite) SetupTest() {
 		NwkSEncKey:  lorawan.AES128Key{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16},
 	}
 	ts.CreateDeviceSession(ds)
+
 }
 
 func (ts *ClassCTestSuite) TestClassC() {
 	assert := require.New(ts.T())
-	defaults := config.C.NetworkServer.Band.Band.GetDefaults()
+	defaults := band.Band().GetDefaults()
 
 	txInfo := gw.DownlinkTXInfo{
 		GatewayId:   []byte{1, 2, 1, 2, 1, 2, 1, 2},
 		Immediately: true,
 		Frequency:   uint32(defaults.RX2Frequency),
-		Power:       int32(config.C.NetworkServer.Band.Band.GetDownlinkTXPower(defaults.RX2Frequency)),
+		Power:       int32(band.Band().GetDownlinkTXPower(defaults.RX2Frequency)),
+		Timing:      gw.DownlinkTiming_IMMEDIATELY,
+		TimingInfo: &gw.DownlinkTXInfo_ImmediatelyTimingInfo{
+			ImmediatelyTimingInfo: &gw.ImmediatelyTimingInfo{},
+		},
 	}
-	assert.NoError(helpers.SetDownlinkTXInfoDataRate(&txInfo, 5, config.C.NetworkServer.Band.Band))
+	assert.NoError(helpers.SetDownlinkTXInfoDataRate(&txInfo, 5, band.Band()))
 
 	fPortTen := uint8(10)
 
@@ -170,10 +185,10 @@ func (ts *ClassCTestSuite) TestClassC() {
 			Name: "containing mac-commands",
 			BeforeFunc: func(*DownlinkTest) error {
 				ts.ServiceProfile.DevStatusReqFreq = 1
-				if err := storage.UpdateServiceProfile(config.C.PostgreSQL.DB, ts.ServiceProfile); err != nil {
+				if err := storage.UpdateServiceProfile(storage.DB(), ts.ServiceProfile); err != nil {
 					return err
 				}
-				if err := storage.FlushServiceProfileCache(config.C.Redis.Pool, ts.ServiceProfile.ID); err != nil {
+				if err := storage.FlushServiceProfileCache(storage.RedisPool(), ts.ServiceProfile.ID); err != nil {
 					return err
 				}
 
