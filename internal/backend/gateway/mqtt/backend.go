@@ -22,6 +22,7 @@ import (
 	"github.com/brocaar/loraserver/internal/backend/gateway/marshaler"
 	"github.com/brocaar/loraserver/internal/config"
 	"github.com/brocaar/loraserver/internal/helpers"
+	"github.com/brocaar/loraserver/internal/storage"
 	"github.com/brocaar/lorawan"
 )
 
@@ -246,6 +247,11 @@ func (b *Backend) rxPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(uplinkFrame.RxInfo)
+	_, err = storage.GetGateway(storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
 	b.setGatewayMarshaler(gatewayID, t)
 
 	// Since with MQTT all subscribers will receive the uplink messages sent
@@ -284,6 +290,11 @@ func (b *Backend) statsPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(&gatewayStats)
+	_, err = storage.GetGateway(storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
 	b.setGatewayMarshaler(gatewayID, t)
 
 	// Since with MQTT all subscribers will receive the stats messages sent
@@ -321,6 +332,11 @@ func (b *Backend) ackPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(&ack)
+	_, err = storage.GetGateway(storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
 	b.setGatewayMarshaler(gatewayID, t)
 
 	// Since with MQTT all subscribers will receive the ack messages sent
