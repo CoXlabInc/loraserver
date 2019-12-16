@@ -24,6 +24,7 @@ import (
 	"github.com/brocaar/chirpstack-network-server/internal/backend/gateway/marshaler"
 	"github.com/brocaar/chirpstack-network-server/internal/config"
 	"github.com/brocaar/chirpstack-network-server/internal/helpers"
+	"github.com/brocaar/chirpstack-network-server/internal/storage"
 	"github.com/brocaar/lorawan"
 )
 
@@ -240,6 +241,11 @@ func (b *Backend) rxPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(uplinkFrame.RxInfo)
+	_, err = storage.GetGateway(nil, storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
 	b.setGatewayMarshaler(gatewayID, t)
 	uplinkID := helpers.GetUplinkID(uplinkFrame.RxInfo)
 
@@ -279,6 +285,12 @@ func (b *Backend) statsPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(&gatewayStats)
+	_, err = storage.GetGateway(nil, storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
+
 	statsID := helpers.GetStatsID(&gatewayStats)
 	b.setGatewayMarshaler(gatewayID, t)
 
@@ -318,6 +330,12 @@ func (b *Backend) ackPacketHandler(c paho.Client, msg paho.Message) {
 	}
 
 	gatewayID := helpers.GetGatewayID(&ack)
+	_, err = storage.GetGateway(nil, storage.DB(), gatewayID);
+	if err != nil {
+		log.WithError(err).Debug("gateway/mqtt: gateway not belong to me")
+		return
+	}
+
 	downlinkID := helpers.GetDownlinkID(&ack)
 	b.setGatewayMarshaler(gatewayID, t)
 

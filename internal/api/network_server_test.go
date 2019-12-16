@@ -451,6 +451,11 @@ func TestNetworkServerAPI(t *testing.T) {
 			}
 			So(storage.SaveDeviceSession(context.Background(), storage.RedisPool(), ds), ShouldBeNil)
 
+			ds := storage.DeviceSession{
+				DevEUI: d.DevEUI,
+			}
+			So(storage.SaveDeviceSession(storage.RedisPool(), ds), ShouldBeNil)
+
 			Convey("Given an item in the device-queue", func() {
 				_, err := api.CreateDeviceQueueItem(ctx, &ns.CreateDeviceQueueItemRequest{
 					Item: &ns.DeviceQueueItem{
